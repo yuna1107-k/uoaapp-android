@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-   API 30 以下の自動バックアップ。API 31 以上は data_extraction_rules.xml が使われる。
+   API 30 以下の自動バックアップ (android:fullBackupContent)。
    資格情報の prefs は Android Keystore の鍵で暗号化していて、鍵は端末から持ち出せない。
    別端末に復元しても復号できないので、最初からバックアップに含めない。
 -->

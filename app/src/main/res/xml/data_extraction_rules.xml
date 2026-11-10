@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
+   Android 12 以降のバックアップと機種変更時の転送 (android:dataExtractionRules)。
    資格情報の prefs は Android Keystore の鍵で暗号化していて、鍵は端末から持ち出せない。
    クラウドバックアップ・端末間転送のどちらでも復号できないので含めない (backup_rules.xml と同じ)。
 -->

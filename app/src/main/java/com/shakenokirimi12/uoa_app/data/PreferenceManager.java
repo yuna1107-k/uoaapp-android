@@ -41,6 +41,12 @@ public class PreferenceManager {
     private static final String KEY_IDP_SSO_COOKIE_HEADER = "idp_sso_cookie_header";
     private static final String KEY_MOODLE_SESSION_COOKIE_HEADER = "moodle_session_cookie_header";
 
+    /** 暗号化側にだけ置く値。平文 prefs に見つかったら移して消す。 */
+    private static final String[] SECRET_KEYS = {
+            KEY_USERNAME, KEY_PASSWORD, KEY_MOODLE_TOKEN, KEY_REVIEW_USER_ID,
+            KEY_CS_IDP_SESSION_COOKIE_HEADER, KEY_IDP_SSO_COOKIE_HEADER, KEY_MOODLE_SESSION_COOKIE_HEADER,
+    };
+
     private static PreferenceManager instance;
     private final SharedPreferences prefs;
     // 資格情報とセッション cookie。名前はバックアップ除外の設定 (res/xml) と揃える。
@@ -57,29 +63,25 @@ public class PreferenceManager {
         migrateLegacyCredentials();
     }
 
+    /**
+     * 平文 prefs に残っている資格情報を暗号化側へ移して消す。昔の版 (平文保存) と、以前の
+     * 「暗号化に失敗したら平文 prefs をそのまま使う」フォールバックで書かれたものの両方を拾う。
+     * 暗号化側に既に値があればそちらを優先する (平文側は古い写しとみなして消すだけ)。
+     */
     private void migrateLegacyCredentials() {
-        if (prefs.contains(KEY_PASSWORD)) {
-            String legacyUsername = prefs.getString(KEY_USERNAME, "");
-            String legacyPassword = prefs.getString(KEY_PASSWORD, "");
-            String legacyMoodleToken = prefs.getString(KEY_MOODLE_TOKEN, "");
-
-            if (!legacyUsername.isEmpty()) {
-                secure.putString(KEY_USERNAME, legacyUsername);
+        SharedPreferences.Editor plainEdit = prefs.edit();
+        boolean found = false;
+        for (String key : SECRET_KEYS) {
+            if (!prefs.contains(key)) continue;
+            found = true;
+            String value = prefs.getString(key, "");
+            if (!value.isEmpty() && !secure.contains(key)) {
+                secure.putString(key, value);
             }
-            if (!legacyPassword.isEmpty()) {
-                secure.putString(KEY_PASSWORD, legacyPassword);
-            }
-            if (!legacyMoodleToken.isEmpty()) {
-                secure.putString(KEY_MOODLE_TOKEN, legacyMoodleToken);
-            }
-
-            // Delete plain text legacy credentials
-            prefs.edit()
-                    .remove(KEY_USERNAME)
-                    .remove(KEY_PASSWORD)
-                    .remove(KEY_MOODLE_TOKEN)
-                    .apply();
+            plainEdit.remove(key);
         }
+        if (!found) return;
+        plainEdit.apply();
     }
 
     public static synchronized PreferenceManager getInstance(Context context) {
