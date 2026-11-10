@@ -19,8 +19,8 @@ android {
         applicationId = "com.shakenokirimi12.uoa_app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "2.0_bata.0.1"
+        versionCode = providers.gradleProperty("uoaVersionCode").map { it.toInt() }.getOrElse(451220)
+        versionName = providers.gradleProperty("uoaVersionName").getOrElse("3.5.0")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
