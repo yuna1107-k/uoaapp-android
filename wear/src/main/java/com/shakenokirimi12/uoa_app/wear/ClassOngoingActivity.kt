@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -32,12 +33,15 @@ object ClassOngoingActivity {
     private const val LEAD_MS = 30 * 60_000L
     /** 切り替わりちょうどに起きると境界の手前と判定されうるので、少し後ろにずらす。 */
     private const val ALARM_MARGIN_MS = 2_000L
+    /** 終了直前(1秒未満)の授業はすでに終了扱いにして00:00での投稿を防ぐ。 */
+    private const val MIN_REMAINING_MS = 1_000L
 
     fun refresh(context: Context) {
         val ctx = context.applicationContext
         val now = System.currentTimeMillis()
         val events = TimetableStore.load(ctx).filter { !it.isCancelled }
-        val current = events.firstOrNull { it.isOngoing(now) }
+        // 終了直前のコマはすでに終了とみなし、00:00 のまま残るのを防ぐ
+        val current = events.firstOrNull { it.isOngoing(now) && it.endMs - now > MIN_REMAINING_MS }
         val next = events.firstOrNull { it.startMs > now }
 
         val boundary: Long = when {
@@ -64,6 +68,14 @@ object ClassOngoingActivity {
     }
 
     private fun post(ctx: Context, label: String, c: ClassEvent, countdownTo: Long) {
+        val now = System.currentTimeMillis()
+        val remainingMs = countdownTo - now
+        // すでに終了時刻を過ぎている(または直前)なら出さずにキャンセル
+        if (remainingMs <= MIN_REMAINING_MS) {
+            cancel(ctx)
+            return
+        }
+
         val nm = ctx.getSystemService(NotificationManager::class.java)
         // IMPORTANCE_LOW: 音も振動も出さない。Ongoing Activity の表示には影響しない。
         nm.createNotificationChannel(
@@ -86,9 +98,11 @@ object ClassOngoingActivity {
             .setWhen(countdownTo)
             .setUsesChronometer(true)
             .setChronometerCountDown(true)
+            // 目標時刻に達したらOS側で自動的に通知を消去する (アラーム遅延等で00:00のまま残るのを防止)
+            .setTimeoutAfter(remainingMs)
 
         // TimerPart は elapsedRealtime 基準。壁時計の目標時刻をその基準に直す。
-        val zeroAt = SystemClock.elapsedRealtime() + (countdownTo - System.currentTimeMillis())
+        val zeroAt = SystemClock.elapsedRealtime() + remainingMs
         val status = Status.Builder()
             .addTemplate("#label# #time#")
             .addPart("label", Status.TextPart(if (label == "授業中") "授業中 残り" else "開始まで"))
@@ -122,12 +136,19 @@ object ClassOngoingActivity {
     )
 
     private fun scheduleAt(ctx: Context, at: Long) {
-        // 正確なアラームの権限は求めない (スマホ版と同じ)。数分ずれても残り時間の表示は TimerPart が正しく進める。
-        ctx.getSystemService(AlarmManager::class.java).set(AlarmManager.RTC_WAKEUP, at, alarmIntent(ctx))
+        val am = ctx.getSystemService(AlarmManager::class.java) ?: return
+        // Doze (アンビエント/スリープ) 中でも切り替わり時刻に確実に起こすため AllowWhileIdle を使う。
+        // 時計がスリープしている間にアラームが遅延して00:00のまま放置されるのを防ぐ。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.canScheduleExactAlarms()) {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, alarmIntent(ctx))
+        } else {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, alarmIntent(ctx))
+        }
     }
 
     private fun cancelAlarm(ctx: Context) {
-        ctx.getSystemService(AlarmManager::class.java).cancel(alarmIntent(ctx))
+        val am = ctx.getSystemService(AlarmManager::class.java) ?: return
+        am.cancel(alarmIntent(ctx))
     }
 
     /** 切り替わりの時刻に起きて作り直す。再起動後も組み直す。 */
