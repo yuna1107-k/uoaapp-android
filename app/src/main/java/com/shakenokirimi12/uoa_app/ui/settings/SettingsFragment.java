@@ -191,9 +191,12 @@ public class SettingsFragment extends Fragment {
         switchClassNotification.setChecked(prefs.isClassNotificationEnabled());
         switchClassNotification.setOnCheckedChangeListener((v, checked) -> {
             prefs.setClassNotificationEnabled(checked);
-            // OFF なら今出ている分を消す。ON なら手元の時間割で今日の分を出す (startForToday が判定する)。
-            com.shakenokirimi12.uoa_app.services.notification.ClassNotificationService.startForToday(
-                    requireContext(), DataCache.getInstance(requireContext()).loadEvents());
+            // OFF なら今出ている分を消す。ON なら手元の時間割で今日の分を出す。
+            if (checked) {
+                com.shakenokirimi12.uoa_app.services.notification.ClassLiveUpdate.refresh(requireContext());
+            } else {
+                com.shakenokirimi12.uoa_app.services.notification.ClassLiveUpdate.stop(requireContext());
+            }
         });
 
         // Lunch notify with time picker

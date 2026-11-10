@@ -352,5 +352,4 @@ public class IdPOtpRegistrationFragment extends Fragment {
         if (url == null || secret == null) return;
         AuthenticatorKeyActions.showKeyDialog(this, url, secret);
     }
-    }
 }

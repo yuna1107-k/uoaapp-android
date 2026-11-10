@@ -61,6 +61,10 @@ public final class ClassLiveUpdate {
      */
     public static void refresh(@NonNull Context context) {
         Context ctx = context.getApplicationContext();
+        if (!com.shakenokirimi12.uoa_app.data.PreferenceManager.getInstance(ctx).isClassNotificationEnabled()) {
+            stop(ctx);
+            return;
+        }
         List<GroupedClass> classes = todayClasses(ctx);
         long now = System.currentTimeMillis();
 
@@ -78,13 +82,13 @@ public final class ClassLiveUpdate {
         if (current != null) {
             long start = current.getDtstart().getTime();
             long end = current.getDtend().getTime();
-            post(ctx, build(ctx, current.getSummary(), current.getLocation(), subText(current),
+            post(ctx, build(ctx, current.getSummary(), current.getLocation(), subText(ctx, current),
                     end, percent(now - start, end - start)));
             boundary = end;
         } else if (next != null && next.getDtstart().getTime() - now <= LEAD_MS) {
             long start = next.getDtstart().getTime();
             post(ctx, build(ctx, ctx.getString(R.string.class_notify_next_prefix, next.getSummary()),
-                    next.getLocation(), subText(next),
+                    next.getLocation(), subText(ctx, next),
                     start, percent(LEAD_MS - (start - now), LEAD_MS)));
             boundary = start;
         } else if (next != null) {
@@ -221,10 +225,10 @@ public final class ClassLiveUpdate {
     }
 
     /** 「2限  10:50 - 12:30」。限が取れない授業では時刻だけ。 */
-    private static String subText(GroupedClass g) {
+    private static String subText(Context ctx, GroupedClass g) {
         SimpleDateFormat fmt = new SimpleDateFormat("HH:mm", Locale.JAPANESE);
         String time = fmt.format(g.getDtstart()) + " - " + fmt.format(g.getDtend());
-        String periods = g.formatPeriods();
+        String periods = g.formatPeriods(ctx);
         return periods.isEmpty() ? time : periods + "  " + time;
     }
 

@@ -9,7 +9,7 @@ import com.shakenokirimi12.uoa_app.data.DataCache;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.services.idp.OtpMethod;
 import com.shakenokirimi12.uoa_app.services.notification.AssignmentCountdownNotifier;
-import com.shakenokirimi12.uoa_app.services.notification.ClassNotificationService;
+import com.shakenokirimi12.uoa_app.services.notification.ClassLiveUpdate;
 import com.shakenokirimi12.uoa_app.services.push.AssignmentReminderSync;
 import com.shakenokirimi12.uoa_app.widget.ClassScheduleWidgetProvider;
 
@@ -107,7 +107,7 @@ public final class AccountSwitch {
         // 放置すると次の定期更新まで前のユーザーの時間割が出続ける。
         ClassScheduleWidgetProvider.refresh(context);
         AssignmentCountdownNotifier.clearAll(context);
-        ClassNotificationService.stop(context);
+        ClassLiveUpdate.stop(context);
     }
 
     /**
