@@ -1,0 +1,211 @@
+package com.shakenokirimi12.uoa_app.ui.timetable;
+
+import android.content.Context;
+import android.content.Intent;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
+
+import com.shakenokirimi12.uoa_app.MainActivity;
+import com.shakenokirimi12.uoa_app.R;
+import com.shakenokirimi12.uoa_app.data.DataCache;
+import com.shakenokirimi12.uoa_app.data.timetable.SharedTimetable;
+import com.shakenokirimi12.uoa_app.data.timetable.TimetableFriend;
+import com.shakenokirimi12.uoa_app.data.timetable.TimetableShareLink;
+import com.shakenokirimi12.uoa_app.data.timetable.TimetableShareStore;
+import com.shakenokirimi12.uoa_app.databinding.ActivityTimetableIncomingBinding;
+import com.shakenokirimi12.uoa_app.services.TimetableShareApi;
+import com.shakenokirimi12.uoa_app.ui.util.EdgeToEdge;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * 友達の共有を開く画面 (iOS の IncomingTimetableSheet)。標準のカメラで QR (uoa-app://timetable?id=...) を読む・
+ * 案内ページの「アプリで開く」・一覧の「リンクを貼り付けて開く」から来る。
+ * 友達の時間割を見せ、保存と同時に自分の時間割を送り返す (1 回の操作で交換が済む)。
+ * 署名付き (v3) の共有なら「今期だけ保存」と「今後も共有し続ける」を選べる (docs/timetable-share-v3.md の 10.5)。
+ */
+public class TimetableIncomingActivity extends AppCompatActivity {
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private ActivityTimetableIncomingBinding binding;
+    private TimetableShareStore store;
+    @Nullable private String shareId;
+    @Nullable private TimetableShareStore.Incoming incoming;
+
+    @NonNull
+    public static Intent intent(@NonNull Context ctx, @NonNull String shareId) {
+        return new Intent(ctx, TimetableIncomingActivity.class)
+                .setAction(Intent.ACTION_VIEW)
+                .setData(Uri.parse(TimetableShareLink.appUrl(shareId)));
+    }
+
+    @Override
+    protected void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        binding = ActivityTimetableIncomingBinding.inflate(getLayoutInflater());
+        setContentView(binding.getRoot());
+        EdgeToEdge.apply(this, binding.incomingRoot, null);
+        store = TimetableShareStore.getInstance(this);
+        binding.toolbar.setNavigationOnClickListener(v -> finish());
+        binding.buttonSaveAndSend.setOnClickListener(v -> accept(true));
+        binding.buttonSaveOnly.setOnClickListener(v -> accept(false));
+        binding.buttonSave.setOnClickListener(v -> accept(false));
+        binding.radioSaveMode.setOnCheckedChangeListener((group, checkedId) -> renderSaveMode());
+        handle(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handle(intent);
+    }
+
+    @Override
+    protected void onDestroy() {
+        executor.shutdown();
+        super.onDestroy();
+    }
+
+    private void handle(@Nullable Intent intent) {
+        Uri data = intent != null ? intent.getData() : null;
+        shareId = TimetableShareLink.shareId(data != null ? data.toString() : "");
+        incoming = null;
+        if (shareId == null) {
+            result(false, getString(R.string.timetable_incoming_open_failed_title),
+                    getString(R.string.timetable_incoming_invalid_link_message), false);
+            return;
+        }
+        progress(R.string.timetable_loading);
+        String id = shareId;
+        executor.execute(() -> {
+            TimetableShareStore.Incoming t = null;
+            String error = null;
+            try {
+                // 署名付きなら確かめる。合わない共有・自分の QR はここで断る (保存しない)。
+                t = store.open(id);
+            } catch (TimetableShareApi.Failure e) {
+                error = e.message(this);
+            }
+            TimetableShareStore.Incoming ft = t;
+            String err = error;
+            main.post(() -> {
+                if (isFinishing() || isDestroyed() || !id.equals(shareId)) return;
+                if (ft != null) loaded(ft);
+                else result(false, getString(R.string.timetable_incoming_receive_failed_title), err, false);
+            });
+        });
+    }
+
+    @Nullable
+    private SharedTimetable myTimetable() {
+        return store.myTimetable(DataCache.getInstance(this).loadEvents(), System.currentTimeMillis());
+    }
+
+    private void progress(int textRes) {
+        binding.buttonOpenSaved.setVisibility(View.GONE);
+        binding.groupProgress.setVisibility(View.VISIBLE);
+        binding.textProgress.setText(textRes);
+        binding.groupLoaded.setVisibility(View.GONE);
+        binding.groupResult.setVisibility(View.GONE);
+    }
+
+    private void loaded(@NonNull TimetableShareStore.Incoming in) {
+        incoming = in;
+        SharedTimetable t = in.timetable;
+        binding.groupProgress.setVisibility(View.GONE);
+        binding.groupResult.setVisibility(View.GONE);
+        binding.groupLoaded.setVisibility(View.VISIBLE);
+        binding.textName.setText(t.name.isEmpty()
+                ? TimetableShareStore.unnamed() : getString(R.string.timetable_incoming_name_format, t.name));
+        binding.textCount.setText(getString(R.string.timetable_incoming_count_format, t.classes.size()));
+        binding.grid.setData(t.classes, null);
+        boolean canSendBack = myTimetable() != null;
+        binding.groupSendBack.setVisibility(canSendBack ? View.VISIBLE : View.GONE);
+        binding.groupSaveOnly.setVisibility(canSendBack ? View.GONE : View.VISIBLE);
+        // 継続共有は署名付きのときだけ選べる。同じ鍵の友達にフィードがもうあれば、選ばせない。
+        boolean signed = in.share != null;
+        binding.groupSaveMode.setVisibility(canSendBack && signed && !in.alreadySharing ? View.VISIBLE : View.GONE);
+        binding.textAlreadySharing.setVisibility(canSendBack && signed && in.alreadySharing ? View.VISIBLE : View.GONE);
+        binding.radioSaveMode.check(R.id.radio_save_term);
+        renderSaveMode();
+        binding.editName.setText(store.myName());
+    }
+
+    private boolean keepSharingSelected() {
+        return binding.groupSaveMode.getVisibility() == View.VISIBLE
+                && binding.radioSaveMode.getCheckedRadioButtonId() == R.id.radio_save_keep;
+    }
+
+    /** 「今後も共有し続ける」を選んでいる間は「保存だけ」を出さない (続けるには自分の時間割を送る)。 */
+    private void renderSaveMode() {
+        boolean keep = keepSharingSelected();
+        binding.textSaveModeNote.setText(keep ? R.string.timetable_save_mode_keep_note : R.string.timetable_save_mode_term_note);
+        binding.buttonSaveOnly.setVisibility(keep ? View.GONE : View.VISIBLE);
+    }
+
+    private void accept(boolean sendBack) {
+        TimetableShareStore.Incoming t = incoming;
+        String id = shareId;
+        if (t == null || id == null) return;
+        boolean keep = sendBack && keepSharingSelected();
+        if (sendBack) store.setMyName(binding.editName.getText() != null ? binding.editName.getText().toString() : "");
+        progress(R.string.timetable_saving);
+        executor.execute(() -> {
+            // 名前を変えたあとの時間割を、今の時刻で作る (署名付きの共有は作った時刻から 24 時間しか受け付けられない)。
+            SharedTimetable mine = sendBack ? myTimetable() : null;
+            TimetableShareStore.Accepted a = store.accept(id, t, sendBack, keep, mine);
+            String err = a.sendError != null ? a.sendError.message(this) : null;
+            main.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                TimetableFriend friend = a.friend;
+                java.util.List<String> lines = new java.util.ArrayList<>();
+                if (a.sent) lines.add(getString(R.string.timetable_incoming_sent_back_message));
+                if (err != null) lines.add(getString(R.string.timetable_incoming_send_back_failed_format, err));
+                if (a.sharingNotStarted) lines.add(getString(R.string.timetable_offer_failed));
+                // この操作で申し込んだときだけ。前から承認待ちの友達・保存だけのときは出さない。
+                if (a.startedWaiting) lines.add(getString(R.string.timetable_incoming_waiting));
+                String body = lines.isEmpty() ? null : String.join("\n", lines);
+                String title = a.updated ? getString(R.string.timetable_incoming_updated_title_format, friend.name)
+                        : getString(R.string.timetable_incoming_saved_title_format, friend.name);
+                result(true, title, body, err != null || a.sharingNotStarted);
+                binding.buttonOpenSaved.setVisibility(View.VISIBLE);
+                binding.buttonOpenSaved.setOnClickListener(v -> {
+                    // アプリの画面 (MainActivity) で、保存した友達の時間割を開く。カメラから開いたときは
+                    // カメラのタスクにいるので、アプリのタスクへ移る。
+                    startActivity(new Intent(this, MainActivity.class)
+                            .putExtra(MainActivity.EXTRA_OPEN_TIMETABLE_FRIEND, friend.id)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                                    | Intent.FLAG_ACTIVITY_SINGLE_TOP));
+                    finish();
+                });
+            });
+        });
+    }
+
+    private void result(boolean ok, @NonNull String title, @Nullable String body, boolean bodyIsError) {
+        binding.groupProgress.setVisibility(View.GONE);
+        binding.groupLoaded.setVisibility(View.GONE);
+        binding.groupResult.setVisibility(View.VISIBLE);
+        binding.imageResult.setImageResource(ok ? R.drawable.ic_check_circle : R.drawable.ic_alert);
+        binding.imageResult.setImageTintList(ContextCompat.getColorStateList(this, ok ? R.color.success : R.color.warning));
+        binding.textResultTitle.setText(title);
+        binding.textResultBody.setVisibility(body != null ? View.VISIBLE : View.GONE);
+        binding.textResultBody.setText(body);
+        binding.textResultBody.setTextColor(bodyIsError
+                ? ContextCompat.getColor(this, R.color.error)
+                : com.google.android.material.color.MaterialColors.getColor(binding.textResultBody,
+                        com.google.android.material.R.attr.colorOnSurfaceVariant));
+        binding.textResultHint.setVisibility(ok ? View.VISIBLE : View.GONE);
+        binding.toolbar.setNavigationContentDescription(R.string.timetable_close);
+    }
+}

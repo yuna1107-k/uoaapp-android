@@ -9,7 +9,9 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.shakenokirimi12.uoa_app.R;
 
+import com.shakenokirimi12.uoa_app.data.AttendanceManager;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 
 import java.io.ByteArrayOutputStream;
@@ -24,53 +26,46 @@ import java.util.Map;
  * 出席記録。以前は存在しない prefs 名 ("app_preferences") を読んでいて、常に "{}" (2 バイト) しか
  * 書き出せていなかった (2026-09-15 に発覚)。
  *
- * パスワード・セッション cookie・FCM トークン・device_id は入れない。平文ファイルに置く価値より
- * 漏れたときの損害が大きく、端末固有の値は他端末へ持ち込んでも意味が無い。ユーザー名だけは入れる。
+ * ユーザー名・パスワード・セッション cookie・FCM トークン・device_id は入れない。平文ファイルに置く価値より
+ * 漏れたときの損害が大きく、端末固有の値 (PreferenceManager.DEVICE_LOCAL_KEYS) は他端末へ持ち込むと
+ * 2 台が同じ id で登録してプッシュを取り合う。
+ * 以前はユーザー名だけ入れて読み戻していた。別のアカウントでログインしている端末に戻すと、ユーザー名だけが
+ * 入れ替わって今のパスワードと組になり、他人のアカウントへ誤ったパスワードでログインを試み続ける
+ * (大学側でロックされうる)。資格情報はログインし直して入れる。古いファイルにユーザー名があっても読まない。
+ * 読み戻しも SETTINGS_KEYS だけを書くので、ファイルに device_id などが入っていても端末の値は変わらない。
  */
 public class BackupService {
 
     private static final String TAG = "BackupService";
-    private static final int FORMAT_VERSION = 2;
+    private static final int FORMAT_VERSION = 3;
 
-    /** PreferenceManager.PREF_NAME と同じ。 */
-    private static final String PREFS_NAME = "uoa_app_prefs";
-    private static final String ATTENDANCE_PREFS_NAME = "attendance_data_v2";
+    private static final String PREFS_NAME = PreferenceManager.PREF_NAME;
+    /** アカウントごとの出席の記録 (ユーザー名 → JSON。"" は分ける前の記録)。 */
+    private static final String KEY_ATTENDANCE_BY_ACCOUNT = "_attendance_by_account";
 
-    private static final String[] SETTINGS_KEYS = {
+    static final String[] SETTINGS_KEYS = {
             "onboarding_done",
-            "notify_assignments", "notify_grades", "notify_lunch", "lunch_notify_time",
+            "notify_assignments", "notify_lunch", "lunch_notify_time", "class_notification_enabled",
             "selected_notify_times", "custom_notify_times",
-            "bg_notify_change", "bg_notify_success", "bg_notify_failure", "bg_notify_nochange",
-            "sync_interval", "auto_attendance_enabled",
+            "auto_attendance_enabled",
             "main_tabs", "other_tabs",
-            "has_seen_idp_tutorial", "otp_auto_fetch_enabled",
-            "review_consent_given", "review_guidelines_accepted",
+            "has_seen_idp_tutorial",
+            PreferenceManager.KEY_USAGE_STATS_ENABLED,
     };
 
     public static void exportTo(Context ctx, Uri uri) throws Exception {
         SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        Map<String, ?> all = prefs.getAll();
-        JsonObject backup = new JsonObject();
-        backup.addProperty("_version", FORMAT_VERSION);
-        backup.addProperty("username", PreferenceManager.getInstance(ctx).getUsername());
-
-        for (String key : SETTINGS_KEYS) {
-            Object val = all.get(key);
-            if (val instanceof String) backup.addProperty(key, (String) val);
-            else if (val instanceof Boolean) backup.addProperty(key, (Boolean) val);
-            else if (val instanceof Integer) backup.addProperty(key, (Integer) val);
-            else if (val instanceof Long) backup.addProperty(key, (Long) val);
-            else if (val instanceof Float) backup.addProperty(key, (Float) val);
+        AttendanceManager attendance = AttendanceManager.getInstance(ctx);
+        // 出席の記録はアカウントごと (AttendanceManager)。前の版でも読めるよう、今のアカウントの分は前の形でも書く。
+        JsonObject backup = buildBackup(prefs.getAll(), attendance.exportCurrent());
+        JsonObject byAccount = new JsonObject();
+        for (Map.Entry<String, String> e : attendance.exportByAccount().entrySet()) {
+            byAccount.addProperty(e.getKey(), e.getValue());
         }
-
-        SharedPreferences attendancePrefs = ctx.getSharedPreferences(ATTENDANCE_PREFS_NAME, Context.MODE_PRIVATE);
-        String attendanceJson = attendancePrefs.getString("data", null);
-        if (attendanceJson != null) {
-            backup.addProperty("_attendance_data_v2", attendanceJson);
-        }
+        backup.add(KEY_ATTENDANCE_BY_ACCOUNT, byAccount);
 
         try (OutputStream os = ctx.getContentResolver().openOutputStream(uri, "wt")) {
-            if (os == null) throw new Exception("ファイルを開けませんでした");
+            if (os == null) throw new Exception(ctx.getString(R.string.backup_file_open_failed));
             os.write(new Gson().toJson(backup).getBytes(StandardCharsets.UTF_8));
             os.flush();
         }
@@ -80,7 +75,7 @@ public class BackupService {
     public static void importFrom(Context ctx, Uri uri) throws Exception {
         String json;
         try (InputStream is = ctx.getContentResolver().openInputStream(uri)) {
-            if (is == null) throw new Exception("ファイルを開けませんでした");
+            if (is == null) throw new Exception(ctx.getString(R.string.backup_file_open_failed));
             // available() はストリーム全長を保証しない (SAF 経由だと 0 のことがある)。最後まで読む。
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             byte[] chunk = new byte[8192];
@@ -91,9 +86,53 @@ public class BackupService {
 
         JsonObject backup = JsonParser.parseString(json).getAsJsonObject();
         SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        Map<String, ?> current = prefs.getAll();
         SharedPreferences.Editor editor = prefs.edit();
+        applySettings(backup, prefs.getAll(), editor);
+        editor.apply();
+        // 読み戻した設定で「利用状況と診断情報を送る」が OFF になったら、OFF にしたときと同じく回数と ID を消す
+        // (設定の値だけ OFF にすると、それまでの回数と ID が端末に残る)。
+        if (!PreferenceManager.getInstance(ctx).isUsageStatsEnabled()) {
+            com.shakenokirimi12.uoa_app.services.usage.UsageStats.setEnabled(ctx, false);
+        }
+        // 学食通知の ON/OFF と時刻を戻したので、予約もそれに合わせて作り直す。
+        com.shakenokirimi12.uoa_app.services.notification.LunchMenuWorker.reschedule(ctx);
 
+        // 出席の記録は上書きせず足す (読み戻しで今の記録を失わない)。アカウントごとの分があればそれを、無ければ
+        // (前の版のバックアップ) 分ける前の記録として読み、ログインしているアカウントに移す。
+        AttendanceManager attendance = AttendanceManager.getInstance(ctx);
+        if (backup.has(KEY_ATTENDANCE_BY_ACCOUNT) && backup.get(KEY_ATTENDANCE_BY_ACCOUNT).isJsonObject()) {
+            for (Map.Entry<String, JsonElement> e : backup.getAsJsonObject(KEY_ATTENDANCE_BY_ACCOUNT).entrySet()) {
+                if (e.getValue().isJsonPrimitive()) attendance.importRecords(e.getKey(), e.getValue().getAsString());
+            }
+        } else if (backup.has("_attendance_data_v2")) {
+            attendance.importRecords("", backup.get("_attendance_data_v2").getAsString());
+        }
+        Log.d(TAG, "Backup imported");
+    }
+
+    /** 書き出す JSON。SETTINGS_KEYS だけを拾うので、端末固有の値は prefs にあっても入らない。 */
+    static JsonObject buildBackup(Map<String, ?> all, String attendanceJson) {
+        JsonObject backup = new JsonObject();
+        backup.addProperty("_version", FORMAT_VERSION);
+        for (String key : SETTINGS_KEYS) {
+            Object val = all.get(key);
+            if (val instanceof String) backup.addProperty(key, (String) val);
+            else if (val instanceof Boolean) backup.addProperty(key, (Boolean) val);
+            else if (val instanceof Integer) backup.addProperty(key, (Integer) val);
+            else if (val instanceof Long) backup.addProperty(key, (Long) val);
+            else if (val instanceof Float) backup.addProperty(key, (Float) val);
+        }
+        if (attendanceJson != null) {
+            backup.addProperty("_attendance_data_v2", attendanceJson);
+        }
+        return backup;
+    }
+
+    /**
+     * 読み戻す。SETTINGS_KEYS だけを書く。ファイルに device_id / fcm_token があっても (手で足された、
+     * 別の版が書いた等) 無視し、この端末の値を上書きしない。
+     */
+    static void applySettings(JsonObject backup, Map<String, ?> current, SharedPreferences.Editor editor) {
         for (String key : SETTINGS_KEYS) {
             if (!backup.has(key)) continue;
             JsonElement elem = backup.get(key);
@@ -110,19 +149,5 @@ public class BackupService {
                 editor.putString(key, elem.getAsString());
             }
         }
-        editor.apply();
-
-        if (backup.has("username")) {
-            String username = backup.get("username").getAsString();
-            if (!username.isEmpty()) PreferenceManager.getInstance(ctx).setUsername(username);
-        }
-
-        if (backup.has("_attendance_data_v2")) {
-            ctx.getSharedPreferences(ATTENDANCE_PREFS_NAME, Context.MODE_PRIVATE)
-                    .edit()
-                    .putString("data", backup.get("_attendance_data_v2").getAsString())
-                    .apply();
-        }
-        Log.d(TAG, "Backup imported");
     }
 }

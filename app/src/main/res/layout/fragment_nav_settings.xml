@@ -19,13 +19,13 @@
             android:layout_marginStart="16dp"
             android:layout_marginTop="16dp"
             android:layout_marginEnd="16dp"
-            android:text="タップして表示先を入れ替えます。「その他」タブは常にナビゲーションの末尾に固定表示されます。" />
+            android:text="@string/nav_settings_description" />
 
         <TextView
             style="@style/Widget.Uoa.SectionHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="ナビゲーションバーに表示 (最大4つ)" />
+            android:text="@string/nav_settings_bottom_tabs_header" />
 
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
@@ -44,7 +44,7 @@
             style="@style/Widget.Uoa.SectionHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="「その他」に表示" />
+            android:text="@string/nav_settings_more_header" />
 
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
@@ -67,7 +67,7 @@
             android:layout_marginStart="16dp"
             android:layout_marginTop="24dp"
             android:layout_marginEnd="16dp"
-            android:text="デフォルトに戻す"
+            android:text="@string/nav_settings_reset_button"
             app:icon="@drawable/ic_rotate_ccw"
             app:iconGravity="textStart" />
     </LinearLayout>

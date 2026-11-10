@@ -26,8 +26,6 @@ import java.util.Locale;
 
 public class FacilitiesFragment extends Fragment {
 
-    private static final String EMPTY_MESSAGE = "施設データがありません";
-
     private TextView textDate;
     private TextView textEmpty;
     private View layoutEmpty;
@@ -37,7 +35,6 @@ public class FacilitiesFragment extends Fragment {
     private final FacilityAdapter adapter = new FacilityAdapter();
     private final CampusSquareService csService = new CampusSquareService();
     private final Calendar selectedDate = Calendar.getInstance();
-    private final SimpleDateFormat dateFmt = new SimpleDateFormat("M月d日 (E)", Locale.JAPANESE);
     private final SimpleDateFormat apiFmt = new SimpleDateFormat("yyyyMMdd", Locale.US);
 
     @Nullable
@@ -56,7 +53,11 @@ public class FacilitiesFragment extends Fragment {
         textEmpty = view.findViewById(R.id.text_empty);
         layoutEmpty = view.findViewById(R.id.layout_empty);
         buttonRetry = view.findViewById(R.id.button_retry);
-        buttonRetry.setOnClickListener(v -> loadFacilities());
+        // 再試行は利用者のやり直し。直前のログインの失敗による待ちを解く (日付の切り替えでは解かない)。
+        buttonRetry.setOnClickListener(v -> {
+            csService.allowLoginRetry();
+            loadFacilities();
+        });
         progressBar = view.findViewById(R.id.progress_bar);
         recycler = view.findViewById(R.id.recycler_facilities);
         recycler.setLayoutManager(new LinearLayoutManager(requireContext()));
@@ -76,7 +77,8 @@ public class FacilitiesFragment extends Fragment {
     }
 
     private void updateDateAndLoad() {
-        textDate.setText(dateFmt.format(selectedDate.getTime()));
+        textDate.setText(new SimpleDateFormat(getString(R.string.common_format_date_month_day_weekday), Locale.JAPANESE)
+                .format(selectedDate.getTime()));
         loadFacilities();
     }
 
@@ -92,7 +94,7 @@ public class FacilitiesFragment extends Fragment {
                 if (!isAdded()) return;
                 progressBar.setVisibility(View.GONE);
                 if (facilities.isEmpty()) {
-                    textEmpty.setText(EMPTY_MESSAGE);
+                    textEmpty.setText(R.string.facilities_empty_message);
                     buttonRetry.setVisibility(View.GONE);
                     layoutEmpty.setVisibility(View.VISIBLE);
                 } else {
@@ -110,7 +112,7 @@ public class FacilitiesFragment extends Fragment {
                 // only clue when CampusSquare itself is down.
                 textEmpty.setText(message != null && message.contains("利用できません")
                         ? message
-                        : "施設利用状況を取得できませんでした\n\n" + message);
+                        : getString(R.string.facilities_load_failed_format, message));
                 buttonRetry.setVisibility(View.VISIBLE);
                 layoutEmpty.setVisibility(View.VISIBLE);
             }

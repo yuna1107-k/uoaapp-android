@@ -20,14 +20,14 @@
             android:layout_marginStart="16dp"
             android:layout_marginTop="16dp"
             android:layout_marginEnd="16dp"
-            android:text="本アプリは学生が個人で提供する非公式アプリであり、会津大学とは一切関係ありません。" />
+            android:text="@string/more_disclaimer" />
 
         <!-- Features -->
         <TextView
             style="@style/Widget.Uoa.SectionHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="機能" />
+            android:text="@string/more_features_header" />
 
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
@@ -35,77 +35,13 @@
             android:layout_marginStart="16dp"
             android:layout_marginEnd="16dp">
 
+            <!-- タブに置ける画面のうち下タブに無いものの行は、MoreFragment が先頭に差し込む
+                 (MainTabs.moreTabKeys)。ここに置くのは「その他」にしか無い画面だけ。 -->
             <LinearLayout
+                android:id="@+id/layout_more_features"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
-
-                <TextView
-                    android:id="@+id/button_reviews"
-                    style="@style/Widget.Uoa.ListRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:drawableStart="@drawable/ic_review"
-                    android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="授業評価" />
-
-                <com.google.android.material.divider.MaterialDivider
-                    android:id="@+id/divider_reviews"
-                    style="@style/Widget.Uoa.Divider"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content" />
-
-                <TextView
-                    android:id="@+id/button_grades"
-                    style="@style/Widget.Uoa.ListRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:drawableStart="@drawable/ic_grades"
-                    android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="成績一覧" />
-
-                <com.google.android.material.divider.MaterialDivider
-                    style="@style/Widget.Uoa.Divider"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content" />
-
-                <TextView
-                    android:id="@+id/button_gakushoku"
-                    style="@style/Widget.Uoa.ListRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:drawableStart="@drawable/ic_restaurant"
-                    android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="学食メニュー" />
-
-                <com.google.android.material.divider.MaterialDivider
-                    style="@style/Widget.Uoa.Divider"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content" />
-
-                <TextView
-                    android:id="@+id/button_facilities"
-                    style="@style/Widget.Uoa.ListRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:drawableStart="@drawable/ic_building"
-                    android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="施設利用状況" />
-
-                <com.google.android.material.divider.MaterialDivider
-                    android:id="@+id/divider_campus_map"
-                    style="@style/Widget.Uoa.Divider"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content" />
-
-                <TextView
-                    android:id="@+id/button_campus_map"
-                    style="@style/Widget.Uoa.ListRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:drawableStart="@drawable/ic_map"
-                    android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="キャンパスマップ" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
@@ -114,7 +50,7 @@
             style="@style/Widget.Uoa.SectionHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="設定" />
+            android:text="@string/settings_title" />
 
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
@@ -128,27 +64,13 @@
                 android:orientation="vertical">
 
                 <TextView
-                    android:id="@+id/button_notifications"
-                    style="@style/Widget.Uoa.ListRow"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:drawableStart="@drawable/ic_inbox"
-                    android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="通知受信ボックス" />
-
-                <com.google.android.material.divider.MaterialDivider
-                    style="@style/Widget.Uoa.Divider"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content" />
-
-                <TextView
                     android:id="@+id/button_settings"
                     style="@style/Widget.Uoa.ListRow"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:drawableStart="@drawable/ic_settings"
                     android:drawableEnd="@drawable/ic_chevron_right"
-                    android:text="設定" />
+                    android:text="@string/settings_title" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

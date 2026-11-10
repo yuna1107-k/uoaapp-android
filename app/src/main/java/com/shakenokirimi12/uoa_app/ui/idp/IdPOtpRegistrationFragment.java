@@ -1,11 +1,5 @@
 package com.shakenokirimi12.uoa_app.ui.idp;
 
-import android.content.ActivityNotFoundException;
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.Context;
-import android.content.Intent;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.PersistableBundle;
 import android.text.Editable;
@@ -16,8 +10,8 @@ import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.TextView;
-import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
@@ -25,26 +19,60 @@ import androidx.lifecycle.ViewModelProvider;
 import androidx.navigation.Navigation;
 
 import com.google.android.material.button.MaterialButton;
-import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+import com.shakenokirimi12.uoa_app.MainActivity;
 import com.shakenokirimi12.uoa_app.R;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
+import com.shakenokirimi12.uoa_app.services.idp.OtpMethod;
 
 /**
  * ワンタイムパスワード未設定のアカウントに対する新規登録画面 (iOS の IdPOTPRegistrationView 相当)。
- * Authenticator 方式は、シークレットをこのアプリ自身が保持・計算するのではなく、otpauth:// URL を外部の
- * 認証アプリへそのまま渡す (「UoA 非公式アプリだけが二段階認証を持つ」状態になるリスクを避けるため)。
+ * 認証アプリ方式では、IdP から受け取ったシークレットを登録が済んだあとアプリが保持してコードを作る
+ * (iOS と同じ。2026-10-24 の利用者の要望)。外部の認証アプリにも追加できるよう、キーを区切って出し、
+ * otpauth:// を受けるアプリを一覧から選んで開ける。Authy は otpauth:// を受けないので、キーのコピーか
+ * 別の端末で QR を読んで追加する (AuthenticatorKeyActions)。
  * 登録操作自体は学内ネットワークからのアクセスでないと SECIOSS 側の仕様で通らない。
+ *
+ * 設定画面からの方式の切り替えにも使う (引数 switching_to)。結果は閉じたときに RESULT_SWITCH で返す。
  */
 public class IdPOtpRegistrationFragment extends Fragment {
-    /** ClipDescription.EXTRA_IS_SENSITIVE (API 33)。minSdk 26 でも参照できるよう値を直接持つ。 */
-    private static final String EXTRA_IS_SENSITIVE = "android.content.extra.IS_SENSITIVE";
+    /** 切り替え先 (OtpMethod.value)。無ければ新規登録。 */
+    public static final String ARG_SWITCHING_TO = "switching_to";
+    /**
+     * true なら、登録が済んだあとホームで取り直す (ログインで鍵が無いと分かり、選択で登録し直しを選んだとき。
+     * MainActivity.openOtpReregistration)。そのときのログインは取り消してあるので、取り直さないとデータが出ないまま。
+     */
+    public static final String ARG_RESYNC_ON_SUCCESS = "resync_on_success";
+    /**
+     * true なら、保存済みの ID / パスワードではなく、初期設定が確かめている最中の値を使う (IdPOtpRegistrationActivity)。
+     * パスワードは引数に載せず、OnboardingActivity.pendingCredentials から読む。
+     */
+    public static final String ARG_ONBOARDING_CREDENTIALS = "onboarding_credentials";
+    /** 切り替えの画面を閉じたときに、設定画面へ返す結果 (FragmentManager の fragment result)。 */
+    public static final String RESULT_SWITCH = "otp_method_switch";
+    /** 結果の中身: 切り替え先 (OtpMethod.value)。 */
+    public static final String RESULT_TARGET = "target";
+    /** 結果の中身: OUTCOME_* のどれか。 */
+    public static final String RESULT_OUTCOME = "outcome";
+    public static final String OUTCOME_SUCCEEDED = "succeeded";
+    public static final String OUTCOME_FAILED = "failed";
+    public static final String OUTCOME_CANCELLED = "cancelled";
 
     private IdPOtpRegistrationViewModel viewModel;
+    @Nullable private OtpMethod switchingTo;
+    /** 今と同じ方式での登録し直し (認証アプリのキーを作り直す)。開いた時点の受け取り方で決める。 */
+    private boolean reRegistering;
+    /** 登録の POST を送ったあと (Stage.COMPLETING) は戻る操作を受け付けない。閉じると成功を受け取れない。 */
+    private final OnBackPressedCallback blockBackWhileCompleting = new OnBackPressedCallback(false) {
+        @Override public void handleOnBackPressed() {}
+    };
+    private TextView textMailConsent, textConfirmNotice;
 
     private View groupProgress, groupStatus, groupMethod, groupEmail, groupConfirm, groupCode, groupAutoFetch, groupCodeInput;
     private TextView textProgress, textStatus, textExistingStatus, textCodePrompt;
     private ImageView imageStatus;
     private MaterialButton buttonCloseStatus, buttonOpenAuthenticator, buttonRegister;
+    private View groupManualSecret;
+    private TextView textManualSecret;
     private EditText editEmail, editCode;
 
     @Nullable
@@ -58,6 +86,15 @@ public class IdPOtpRegistrationFragment extends Fragment {
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
         viewModel = new ViewModelProvider(this).get(IdPOtpRegistrationViewModel.class);
+        String target = getArguments() != null ? getArguments().getString(ARG_SWITCHING_TO) : null;
+        switchingTo = target == null || target.isEmpty() ? null : OtpMethod.from(target);
+        if (savedInstanceState != null) {
+            reRegistering = savedInstanceState.getBoolean(STATE_RE_REGISTERING);
+        } else {
+            PreferenceManager p = PreferenceManager.getInstance(requireContext());
+            reRegistering = switchingTo != null && p.isOtpMethodKnown() && OtpMethod.from(p.getOtpMethod()) == switchingTo;
+        }
+        requireActivity().getOnBackPressedDispatcher().addCallback(getViewLifecycleOwner(), blockBackWhileCompleting);
 
         groupProgress = view.findViewById(R.id.group_progress);
         groupStatus = view.findViewById(R.id.group_status);
@@ -71,21 +108,28 @@ public class IdPOtpRegistrationFragment extends Fragment {
         textStatus = view.findViewById(R.id.text_status);
         textExistingStatus = view.findViewById(R.id.text_existing_status);
         textCodePrompt = view.findViewById(R.id.text_code_prompt);
+        textMailConsent = view.findViewById(R.id.text_mail_consent);
+        textConfirmNotice = view.findViewById(R.id.text_confirm_notice);
         imageStatus = view.findViewById(R.id.image_status);
         buttonCloseStatus = view.findViewById(R.id.button_close_status);
         buttonOpenAuthenticator = view.findViewById(R.id.button_open_authenticator);
         buttonRegister = view.findViewById(R.id.button_register);
         editEmail = view.findViewById(R.id.edit_email);
         editCode = view.findViewById(R.id.edit_code);
+        groupManualSecret = view.findViewById(R.id.group_manual_secret);
+        textManualSecret = view.findViewById(R.id.text_manual_secret);
+        AuthenticatorKeyActions.bindSecretText(textManualSecret, () -> viewModel.groupedSecret());
+        view.findViewById(R.id.button_copy_secret).setOnClickListener(v -> copySecret());
+        view.findViewById(R.id.button_show_qr).setOnClickListener(v -> showQr());
 
-        buttonCloseStatus.setOnClickListener(v -> Navigation.findNavController(v).popBackStack());
+        buttonCloseStatus.setOnClickListener(v -> close());
         view.findViewById(R.id.card_method_email).setOnClickListener(v -> viewModel.chooseEmail());
         view.findViewById(R.id.card_method_authenticator).setOnClickListener(v -> {
-            showProgress("認証アプリ用の情報を取得しています...");
+            showProgress("認証アプリ用の情報を取得しています…");
             viewModel.chooseAuthenticator();
         });
         view.findViewById(R.id.button_email_next).setOnClickListener(v -> {
-            showProgress("確認コードを送信しています...");
+            showProgress("確認コードを送信しています…");
             viewModel.confirmEmailAddressAndProceed(editEmail.getText().toString());
         });
         view.findViewById(R.id.button_confirm_proceed).setOnClickListener(v -> viewModel.proceedAfterConfirmation());
@@ -100,6 +144,10 @@ public class IdPOtpRegistrationFragment extends Fragment {
         buttonRegister.setOnClickListener(v -> viewModel.submitCode(editCode.getText().toString()));
 
         viewModel.stage().observe(getViewLifecycleOwner(), this::render);
+        // 入力したコードがアプリの計算と合わなかった (登録は送っていない)。同じ画面で入力し直してもらう。
+        viewModel.codeMismatch().observe(getViewLifecycleOwner(), mismatch -> {
+            if (Boolean.TRUE.equals(mismatch)) textCodePrompt.setText(R.string.otp_code_mismatch);
+        });
         viewModel.autoFetchingEmailCode().observe(getViewLifecycleOwner(), fetching -> {
             boolean f = Boolean.TRUE.equals(fetching);
             groupAutoFetch.setVisibility(f ? View.VISIBLE : View.GONE);
@@ -107,10 +155,74 @@ public class IdPOtpRegistrationFragment extends Fragment {
         });
 
         PreferenceManager prefs = PreferenceManager.getInstance(requireContext());
-        if (editEmail.getText().length() == 0) {
-            editEmail.setText(prefs.getUsername().trim() + "@u-aizu.ac.jp");
+        String uid = prefs.getUsername();
+        String pass = prefs.getPassword();
+        if (getArguments() != null && getArguments().getBoolean(ARG_ONBOARDING_CREDENTIALS, false)) {
+            String[] pending = com.shakenokirimi12.uoa_app.ui.onboarding.OnboardingActivity.pendingCredentials();
+            if (pending == null) {
+                // プロセスが作り直されて、確かめている最中の値が無い。初期設定に戻ってログインし直してもらう。
+                requireActivity().finish();
+                return;
+            }
+            uid = pending[0];
+            pass = pending[1];
         }
-        viewModel.startOnce(prefs.getUsername(), prefs.getPassword());
+        if (editEmail.getText().length() == 0) {
+            editEmail.setText(uid.trim() + "@u-aizu.ac.jp");
+        }
+        viewModel.startOnce(uid, pass, switchingTo);
+    }
+
+    /** 閉じる。初期設定から開いたとき (nav graph の外) は画面ごと閉じる。 */
+    private void close() {
+        if (getActivity() instanceof IdPOtpRegistrationActivity) {
+            getActivity().finish();
+            return;
+        }
+        Navigation.findNavController(requireView()).popBackStack();
+    }
+
+    private static final String STATE_RE_REGISTERING = "re_registering";
+
+    @Override
+    public void onSaveInstanceState(@NonNull Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putBoolean(STATE_RE_REGISTERING, reRegistering);
+    }
+
+    @Override
+    public void onDestroyView() {
+        setLeaveLocked(false);
+        AuthenticatorKeyActions.setSecure(requireActivity().getWindow(), false);
+        // 画面を離れた (戻る・下タブ)。登録の POST はこの画面が見えている間にしか送らないので、まだ送って
+        // いなければ中断する。下タブで離れると戻る先として残り ViewModel も生きたままになるので、
+        // 中断しないと画面の無いところで登録が進む。回転などの作り直しでは中断しない。
+        // 認証アプリやメールのアプリへ移るだけなら、この画面の View は残るのでここは通らない。
+        if (viewModel != null && !requireActivity().isChangingConfigurations()) viewModel.cancelBeforePost();
+        super.onDestroyView();
+    }
+
+    @Override
+    public void onDestroy() {
+        // 切り替えの画面を閉じた。設定画面が「なぜ変わっていないか」を出せるように結果を返す。
+        IdPOtpRegistrationViewModel.Stage stage = viewModel != null ? viewModel.stage().getValue() : null;
+        // COMPLETING のまま閉じた (Activity ごと終わった等) ときは結果がまだ分からないので返さない。
+        // 受け取り方は登録が済めば OtpRegistrationCommit が書き換え、設定画面は表示のたびに読み直す。
+        if (switchingTo != null && isRemoving() && stage != null
+                && stage != IdPOtpRegistrationViewModel.Stage.COMPLETING) {
+            Bundle result = new Bundle();
+            result.putString(RESULT_TARGET, switchingTo.value);
+            result.putString(RESULT_OUTCOME, stage == IdPOtpRegistrationViewModel.Stage.SUCCESS ? OUTCOME_SUCCEEDED
+                    : stage == IdPOtpRegistrationViewModel.Stage.FAILURE ? OUTCOME_FAILED : OUTCOME_CANCELLED);
+            getParentFragmentManager().setFragmentResult(RESULT_SWITCH, result);
+        }
+        super.onDestroy();
+    }
+
+    /** 戻る (システムの戻る・上バーの戻る・下タブ) を止める / 戻す。 */
+    private void setLeaveLocked(boolean locked) {
+        blockBackWhileCompleting.setEnabled(locked);
+        if (getActivity() instanceof MainActivity) ((MainActivity) getActivity()).setNavigationLocked(locked);
     }
 
     private void showProgress(String message) {
@@ -135,13 +247,16 @@ public class IdPOtpRegistrationFragment extends Fragment {
     }
 
     private void render(IdPOtpRegistrationViewModel.Stage stage) {
+        // キーを出すのは認証アプリのコードを待つ間だけ。そのときだけ画面を写させない (下の WAITING_FOR_CODE)。
+        AuthenticatorKeyActions.setSecure(requireActivity().getWindow(), false);
+        setLeaveLocked(stage == IdPOtpRegistrationViewModel.Stage.COMPLETING);
         switch (stage) {
             case CHECKING:
-                showProgress("確認中...");
+                showProgress("確認中…");
                 break;
             case ALREADY_CONFIGURED:
                 showStatus(R.drawable.ic_shield_check, androidx.appcompat.R.attr.colorPrimary,
-                        "このアカウントは既にワンタイムパスワードが設定済みです。");
+                        "このアカウントは、すでにワンタイムパスワードが設定されています。");
                 break;
             case CHOOSING_METHOD:
                 hideAll();
@@ -155,28 +270,48 @@ public class IdPOtpRegistrationFragment extends Fragment {
                 hideAll();
                 String existing = viewModel.existingStatusLabel();
                 textExistingStatus.setText(existing != null
-                        ? "既に設定済みの方式があります: " + existing
+                        ? "すでに設定されている方式: " + existing
                         : "このアカウントは新規登録になります");
+                textMailConsent.setVisibility(switchingTo == OtpMethod.MAIL ? View.VISIBLE : View.GONE);
+                // 新規登録ではレイアウトの「一度登録すると、未設定の状態には戻せません。」のまま。
+                if (reRegistering) textConfirmNotice.setText(R.string.otp_reregister_notice);
+                else if (switchingTo != null) textConfirmNotice.setText(R.string.otp_switch_keeps_current);
                 groupConfirm.setVisibility(View.VISIBLE);
                 break;
             }
             case WAITING_FOR_CODE: {
                 hideAll();
                 boolean authenticator = viewModel.method() == IdPOtpRegistrationViewModel.Method.AUTHENTICATOR;
-                textCodePrompt.setText(authenticator
-                        ? "Authenticatorアプリで表示されたコードを入力してください"
-                        : "メールに届いたコードを入力してください");
-                buttonOpenAuthenticator.setVisibility(authenticator && viewModel.otpauthUrl() != null ? View.VISIBLE : View.GONE);
+                textCodePrompt.setText(authenticator ? R.string.otp_code_from_app : R.string.otp_code_mail_prompt);
+                // 開けるアプリが無ければ出さない。そのときは下のキーのコピーと QR で追加してもらう。
+                buttonOpenAuthenticator.setVisibility(authenticator && viewModel.otpauthUrl() != null
+                        && AuthenticatorKeyActions.canOpen(requireContext()) ? View.VISIBLE : View.GONE);
+                String secret = authenticator ? viewModel.groupedSecret() : null;
+                groupManualSecret.setVisibility(secret != null ? View.VISIBLE : View.GONE);
+                textManualSecret.setText(secret != null ? secret : "");
+                AuthenticatorKeyActions.setSecure(requireActivity().getWindow(), secret != null);
+                // アプリが作ったコードは入れておかない。外部の認証アプリのコードを打ってもらい、それがアプリの計算と
+                // 合うことで、外部のアプリにも同じキーが入っていると確かめる (iOS と同じ)。
                 editCode.setText("");
                 groupCode.setVisibility(View.VISIBLE);
                 break;
             }
             case COMPLETING:
-                showProgress("登録しています...");
+                showProgress("登録しています…");
                 break;
             case SUCCESS:
+                // 閉じても戻っても、ログインを取り消した元の画面に戻る。その画面は取得に失敗してキャッシュが古いままなので、
+                // 開き直したときに取り直す。ホームはキャッシュに関係なく取り直させる (次にホームを開いたとき。ホームが読んで消す)。
+                if (resyncOnSuccess()) requestHomeSync();
+                if (getActivity() instanceof IdPOtpRegistrationActivity) ((IdPOtpRegistrationActivity) getActivity()).registered();
                 showStatus(R.drawable.ic_check_circle, androidx.appcompat.R.attr.colorPrimary,
-                        "ワンタイムパスワードの設定が完了しました。");
+                        switchingTo == null ? "ワンタイムパスワードの設定が完了しました。"
+                                : reRegistering ? getString(R.string.otp_reregister_done)
+                                : getString(R.string.otp_switch_done));
+                break;
+            case CANCELLED:
+                showStatus(R.drawable.ic_circle_alert, com.google.android.material.R.attr.colorOnSurfaceVariant,
+                        getString(R.string.otp_registration_cancelled));
                 break;
             case FAILURE:
                 showStatus(R.drawable.ic_circle_alert, androidx.appcompat.R.attr.colorError,
@@ -185,44 +320,37 @@ public class IdPOtpRegistrationFragment extends Fragment {
         }
     }
 
-    private void openAuthenticatorApp() {
-        String url = viewModel.otpauthUrl();
-        if (url == null) return;
-        Intent view = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-        // URL には TOTP のシークレットがそのまま入っている。otpauth:// を受け取ると宣言したアプリなら
-        // どれでも受け取れるので、既定アプリに黙って渡さず、毎回ユーザーに渡す先を選ばせる。
-        if (view.resolveActivity(requireContext().getPackageManager()) == null) {
-            showNoAuthenticatorAppDialog();
-            return;
-        }
+    private boolean resyncOnSuccess() {
+        return getArguments() != null && getArguments().getBoolean(ARG_RESYNC_ON_SUCCESS, false);
+    }
+
+    /** ホームの取得 (引っ張って更新と同じ、前面のログイン) をキャッシュに関係なく走らせる (IdPTutorialFragment と同じ印)。 */
+    private void requestHomeSync() {
         try {
-            startActivity(Intent.createChooser(view, "シークレットを渡す認証アプリを選択"));
-        } catch (ActivityNotFoundException e) {
-            showNoAuthenticatorAppDialog();
+            Navigation.findNavController(requireView()).getBackStackEntry(R.id.navigation_home).getSavedStateHandle()
+                    .set(com.shakenokirimi12.uoa_app.ui.home.HomeFragment.KEY_FORCE_SYNC, true);
+        } catch (IllegalArgumentException e) {
+            // ホームが戻る先に無い。開いたときの自動の取得 (キャッシュが古ければ取る) に任せる。
         }
     }
 
-    private void showNoAuthenticatorAppDialog() {
-        MaterialAlertDialogBuilder builder = new MaterialAlertDialogBuilder(requireContext())
-                .setTitle("認証アプリが見つかりません")
-                .setMessage("Google Authenticator等の認証アプリをインストールしてからもう一度お試しください。シークレットをコピーして、認証アプリに手動で追加することもできます。")
-                .setNegativeButton("閉じる", null);
-        String secret = viewModel.authenticatorSecretFallback();
-        if (secret != null) {
-            builder.setPositiveButton("シークレットをコピー", (d, w) -> {
-                ClipboardManager clipboard = (ClipboardManager) requireContext().getSystemService(Context.CLIPBOARD_SERVICE);
-                if (clipboard != null) {
-                    ClipData clip = ClipData.newPlainText("otp secret", secret);
-                    // 機密として印を付ける。Android 13 以降はコピー時のプレビューで中身が伏せられ、
-                    // キーボードのクリップボード候補にも出なくなる (それより前の OS では無視される)。
-                    PersistableBundle extras = new PersistableBundle();
-                    extras.putBoolean(EXTRA_IS_SENSITIVE, true);
-                    clip.getDescription().setExtras(extras);
-                    clipboard.setPrimaryClip(clip);
-                    Toast.makeText(requireContext(), "コピーしました", Toast.LENGTH_SHORT).show();
-                }
-            });
-        }
-        builder.show();
+    private void openAuthenticatorApp() {
+        String url = viewModel.otpauthUrl();
+        if (url == null) return;
+        AuthenticatorKeyActions.open(this, url);
+    }
+
+    private void copySecret() {
+        String secret = viewModel.groupedSecret();
+        if (secret == null) return;
+        AuthenticatorKeyActions.copySecret(requireContext(), secret);
+    }
+
+    private void showQr() {
+        String url = viewModel.otpauthUrl();
+        String secret = viewModel.groupedSecret();
+        if (url == null || secret == null) return;
+        AuthenticatorKeyActions.showKeyDialog(this, url, secret);
+    }
     }
 }

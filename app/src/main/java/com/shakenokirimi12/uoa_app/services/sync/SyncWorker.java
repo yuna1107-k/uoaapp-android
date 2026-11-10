@@ -1,32 +1,26 @@
 package com.shakenokirimi12.uoa_app.services.sync;
 
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.content.Context;
-import android.content.Intent;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
-import androidx.core.app.NotificationCompat;
-import androidx.core.app.NotificationManagerCompat;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 
-import com.shakenokirimi12.uoa_app.MainActivity;
-import com.shakenokirimi12.uoa_app.R;
 import com.shakenokirimi12.uoa_app.data.DataCache;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.Assignment;
 import com.shakenokirimi12.uoa_app.data.models.CalendarEvent;
+import com.shakenokirimi12.uoa_app.services.AccountSwitch;
+import com.shakenokirimi12.uoa_app.services.AuthorizationContext;
 import com.shakenokirimi12.uoa_app.services.AppConfigService;
+import com.shakenokirimi12.uoa_app.services.AuthErrors;
 import com.shakenokirimi12.uoa_app.services.CampusSquareService;
+import com.shakenokirimi12.uoa_app.services.ForceUpdateGate;
 import com.shakenokirimi12.uoa_app.services.MoodleService;
 import com.shakenokirimi12.uoa_app.services.ServiceCallback;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -42,9 +36,14 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class SyncWorker extends Worker {
     private static final String TAG = "SyncWorker";
-    static final String CHANNEL_ID = "background_sync";
-    private static final int NOTIFICATION_ID = 4100;
+    /**
+     * 以前の「同期結果の通知」のチャンネル。通知は「ログインが必要」だけを残して消した (2026-10-22)。
+     * 端末の通知設定に空のチャンネルが残らないよう、起動時に消す (UoaApplication)。
+     */
+    public static final String REMOVED_CHANNEL_ID = "background_sync";
     private static final long STEP_TIMEOUT_SEC = 90;
+    /** 同期の前に設定を取り直すときの上限。取れなくても前に取れた条件で判定できるので短くする。 */
+    static final long CONFIG_TIMEOUT_MS = 10_000L;
 
     // サービスは内部に単一スレッドの executor を持ち、shutdown する口が無い。
     // 実行のたびに new すると 15 分ごとにスレッドが増え続けるので、プロセスで 1 つを使い回す。
@@ -70,7 +69,19 @@ public class SyncWorker extends Worker {
             return Result.success();
         }
         try {
-            return doWorkSerialized();
+            // アプリを開かない日が続いても、前日までの利用状況を送る。失敗しても同期は続ける (例外は投げない)。
+            com.shakenokirimi12.uoa_app.services.usage.UsageStats.sendIfDue(getApplicationContext());
+            Result result = doWorkSerialized();
+            // 取り直した時間割で (取れなくても手元の分で)、終わった授業の欠席を見る。
+            com.shakenokirimi12.uoa_app.services.attendance.AutoAbsenceRunner.evaluate(getApplicationContext());
+            // 登録し直して今の状態を受け取る。届いたところで判定し直す (GeofenceReceiver)。
+            // 失敗しても同期の結果は変えない。
+            try {
+                com.shakenokirimi12.uoa_app.services.LocationGeofenceService.startIfEnabled(getApplicationContext());
+            } catch (RuntimeException e) {
+                Log.e(TAG, "Could not re-register the geofence", e);
+            }
+            return result;
         } finally {
             running.set(false);
         }
@@ -83,48 +94,72 @@ public class SyncWorker extends Worker {
         if (!prefs.hasCredentials()) return Result.success();
 
         // ID/PW 誤りが確定している間は試みない。ここを止めないと、誤ったパスワードで
-        // 定期的にログインを試行し続け、大学側でアカウントがロックされうる。
+        // 定期的にログインを試行し続け、大学側でアカウントがロックされうる。印は ID かパスワードが変わると外れる。
         if (prefs.isCredentialsInvalid()) {
             Log.w(TAG, "Skipping sync: credentials marked invalid");
             return Result.success();
         }
 
+        // 強制アップデートの対象になった版は、裏で大学のサーバーへ通信しない。通信の前に設定を取り直し
+        // (取れなければ前に取れた条件で) 判定する。あわせて killswitch もこの回の同期に効く
+        // (バックグラウンドだけで起きたプロセスは、これまで設定を一度も取っていなかった)。
+        AppConfigService.getInstance().refreshBlocking(ctx, CONFIG_TIMEOUT_MS);
+        if (ForceUpdateGate.getInstance(ctx).isBlocked()) {
+            Log.w(TAG, "Skipping sync: this version must be updated");
+            return Result.success();
+        }
+
+        // ユーザー名より先に控える。同期の途中でアカウントを切り替えたりログアウトしたりしたら、取れた結果を
+        // 片付けたあとのキャッシュ・リマインダー・ウィジェットに書き戻さない (AccountSwitch.runIfCurrent)。
+        AccountSwitch.Ticket ticket = AccountSwitch.ticket();
         String user = prefs.getUsername();
         String pass = prefs.getPassword();
         DataCache cache = DataCache.getInstance(ctx);
         boolean anyFailure = false;
-        boolean changed = false;
+        // 保存済みセッションが切れていて、OTP 付きの新規ログインが要るが、ここでは始められなかった。失敗とは数えない。
+        // 来るのは、バックグラウンドの新規ログインの条件 (BackgroundLoginPolicy: 止めた印・鍵が無いか止めている・
+        // 間隔の制限・メール方式の 6 時間の枠) を満たさないとき。通知は出さない (SPEC.md「12. 通知」)。
+        // Moodle → CampusSquare の順に直列にする。2 本目は 1 本目が保存した IdP の SSO で入る。
+        boolean loginRequired = false;
 
         // 1. Moodle
         if (AppConfigService.getInstance().isFeatureEnabled("moodle_enabled")) {
             AtomicReference<String> loginError = new AtomicReference<>();
-            if (await(latch -> moodle.ensureLoggedIn(user, pass, false, new ServiceCallback<Boolean>() {
+            if (await(latch -> moodle.ensureLoggedIn(user, pass, AuthorizationContext.BACKGROUND, new ServiceCallback<Boolean>() {
                 @Override public void onSuccess(Boolean r) { latch.countDown(); }
                 @Override public void onError(String m) { loginError.set(m); latch.countDown(); }
             }))) {
                 String err = loginError.get();
                 if (err == null) {
                     AtomicReference<List<Assignment>> fetched = new AtomicReference<>();
-                    await(latch -> moodle.fetchAssignments(new ServiceCallback<List<Assignment>>() {
+                    AtomicReference<String> fetchError = new AtomicReference<>();
+                    await(latch -> moodle.fetchAssignments(AuthorizationContext.BACKGROUND, new ServiceCallback<List<Assignment>>() {
                         @Override public void onSuccess(List<Assignment> r) { fetched.set(r); latch.countDown(); }
-                        @Override public void onError(String m) { latch.countDown(); }
+                        @Override public void onError(String m) { fetchError.set(m); latch.countDown(); }
                     }));
                     List<Assignment> assignments = fetched.get();
                     if (assignments != null) {
-                        changed |= differs(cache.loadAssignments(), assignments);
-                        cache.saveAssignments(assignments);
-                        com.shakenokirimi12.uoa_app.services.push.AssignmentReminderSync.sync(ctx, assignments);
-                        com.shakenokirimi12.uoa_app.services.notification.AssignmentCountdownNotifier.post(ctx, assignments);
+                        if (!AccountSwitch.runIfCurrent(ticket, () -> {
+                            cache.saveAssignments(assignments);
+                            com.shakenokirimi12.uoa_app.services.push.AssignmentReminderSync.sync(ctx, assignments);
+                            com.shakenokirimi12.uoa_app.services.notification.AssignmentCountdownNotifier.post(ctx, assignments);
+                        })) {
+                            Log.w(TAG, "Account changed during sync; dropping assignments");
+                            return Result.success();
+                        }
+                    } else if (AuthErrors.isInteractiveLoginRequired(fetchError.get())) {
+                        loginRequired = true;
                     } else {
                         anyFailure = true;
                     }
+                } else if (AuthErrors.isInteractiveLoginRequired(err)) {
+                    loginRequired = true;
                 } else {
                     anyFailure = true;
                     if (MoodleService.isInvalidCredentialsError(err)) {
-                        prefs.setCredentialsInvalid(true);
+                        // 誤りの印と通知は SessionCoordinator (BackgroundLoginPolicy) が付けている。
                         Log.w(TAG, "Credentials rejected; disabling automatic sync until password is re-entered");
                         // 同じ資格情報で CampusSquare も試すと試行回数が倍になるだけなので、ここで止める。
-                        notifyIfEnabled(ctx, prefs, false, false, true);
                         return Result.success();
                     }
                 }
@@ -137,28 +172,36 @@ public class SyncWorker extends Worker {
         if (AppConfigService.getInstance().isFeatureEnabled("campussquare_calendar_enabled")) {
             AtomicReference<List<CalendarEvent>> fetched = new AtomicReference<>();
             AtomicReference<String> csError = new AtomicReference<>();
-            await(latch -> campusSquare.fetchCalendarEvents(user, pass, false, new ServiceCallback<List<CalendarEvent>>() {
+            await(latch -> campusSquare.fetchCalendarEvents(user, pass, AuthorizationContext.BACKGROUND, new ServiceCallback<List<CalendarEvent>>() {
                 @Override public void onSuccess(List<CalendarEvent> r) { fetched.set(r); latch.countDown(); }
                 @Override public void onError(String m) { csError.set(m); latch.countDown(); }
             }));
             if (fetched.get() != null) {
-                cache.saveEvents(fetched.get());
-                // アプリを開かない日でも、授業の常駐通知を今日の時間割で組み直す。
-                com.shakenokirimi12.uoa_app.services.notification.ClassLiveUpdate.refresh(ctx);
-                com.shakenokirimi12.uoa_app.widget.ClassScheduleWidgetProvider.refresh(ctx);
+                if (!AccountSwitch.runIfCurrent(ticket, () -> {
+                    cache.saveEvents(fetched.get());
+                    // アプリを開かない日でも、授業の常駐通知を今日の時間割で組み直す。
+                    com.shakenokirimi12.uoa_app.services.notification.ClassLiveUpdate.refresh(ctx);
+                    com.shakenokirimi12.uoa_app.widget.ClassScheduleWidgetProvider.refresh(ctx);
+                })) {
+                    Log.w(TAG, "Account changed during sync; dropping calendar events");
+                    return Result.success();
+                }
+            } else if (AuthErrors.isInteractiveLoginRequired(csError.get())) {
+                loginRequired = true;
             } else {
                 anyFailure = true;
                 // CampusSquare 側だけで ID/PW 誤りが判明することもある (Moodle が killswitch で
                 // 止まっている、または片方だけ認証方式が変わった場合)。
+                // 誤りの印と通知は SessionCoordinator (BackgroundLoginPolicy) が付けている。
                 if (csError.get() != null && com.shakenokirimi12.uoa_app.services.AuthErrors.isInvalidCredentials(csError.get())) {
-                    prefs.setCredentialsInvalid(true);
                     Log.w(TAG, "CampusSquare rejected credentials; disabling automatic sync");
                 }
             }
         }
 
-        if (!anyFailure) prefs.setLastSync(System.currentTimeMillis());
-        notifyIfEnabled(ctx, prefs, changed, !anyFailure, anyFailure);
+        boolean success = !anyFailure && !loginRequired;
+        // 途中でアカウントが切り替わっていたら、新しいアカウントを同期済みと記録しない。
+        if (success) AccountSwitch.runIfCurrent(ticket, () -> prefs.setLastSync(System.currentTimeMillis()));
         // 失敗は次回の定期実行に任せる。retry にすると指数バックオフで短時間に再ログインを重ねる。
         return Result.success();
     }
@@ -174,58 +217,6 @@ public class SyncWorker extends Worker {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
-        }
-    }
-
-    /** 一覧の増減だけでなく、締切や課題名の変更も「変更あり」に含める。 */
-    private static boolean differs(List<Assignment> before, List<Assignment> after) {
-        if (before == null) return !after.isEmpty();
-        Set<String> a = new HashSet<>();
-        for (Assignment x : before) a.add(x.getId() + "|" + x.getDueDate() + "|" + x.getName());
-        Set<String> b = new HashSet<>();
-        for (Assignment x : after) b.add(x.getId() + "|" + x.getDueDate() + "|" + x.getName());
-        return !a.equals(b);
-    }
-
-    /** 設定画面の「バックグラウンド通知」の項目に従って結果を通知する。 */
-    private static void notifyIfEnabled(Context ctx, PreferenceManager prefs,
-                                        boolean changed, boolean success, boolean failure) {
-        // 4 つのトグルはそれぞれ独立に意味を持たせる。具体的な文面 (変更あり / 変更なし) が
-        // 出せるならそちらを優先し、それらが OFF でも「同期成功」が ON なら成功を伝える。
-        String text;
-        if (failure) {
-            if (!prefs.isBgNotifyFailure()) return;
-            text = prefs.isCredentialsInvalid()
-                    ? ctx.getString(R.string.sync_notify_credentials_invalid)
-                    : ctx.getString(R.string.sync_notify_failure);
-        } else if (changed && prefs.isBgNotifyChange()) {
-            text = ctx.getString(R.string.sync_notify_changed);
-        } else if (!changed && prefs.isBgNotifyNoChange()) {
-            text = ctx.getString(R.string.sync_notify_no_change);
-        } else if (success && prefs.isBgNotifySuccess()) {
-            text = ctx.getString(R.string.sync_notify_success);
-        } else {
-            return;
-        }
-
-        NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
-        nm.createNotificationChannel(new NotificationChannel(
-                CHANNEL_ID, ctx.getString(R.string.sync_channel_name), NotificationManager.IMPORTANCE_LOW));
-
-        PendingIntent open = PendingIntent.getActivity(ctx, 0,
-                new Intent(ctx, MainActivity.class),
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        NotificationCompat.Builder b = new NotificationCompat.Builder(ctx, CHANNEL_ID)
-                .setSmallIcon(R.drawable.ic_stat_notification)
-                .setContentTitle(ctx.getString(R.string.app_name))
-                .setContentText(text)
-                .setContentIntent(open)
-                .setAutoCancel(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW);
-        try {
-            NotificationManagerCompat.from(ctx).notify(NOTIFICATION_ID, b.build());
-        } catch (SecurityException e) {
-            // POST_NOTIFICATIONS 未許可。通知は出せないが同期自体は済んでいる。
         }
     }
 }

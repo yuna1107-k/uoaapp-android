@@ -1,5 +1,9 @@
 package com.shakenokirimi12.uoa_app.data.models;
 
+import android.content.Context;
+
+import com.shakenokirimi12.uoa_app.R;
+
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
@@ -10,7 +14,8 @@ import java.util.Map;
 
 public class GroupedClass {
 
-    private static final int[][] CLASS_PERIODS = {
+    /** {時限, 開始の時, 分, 終了の時, 分}。時間割共有 (data/timetable/TimetableDerivation) も読む。 */
+    public static final int[][] CLASS_PERIODS = {
             {1,  9, 0,  9, 50},
             {2,  9, 50, 10, 40},
             {3,  10, 50, 11, 40},
@@ -59,12 +64,12 @@ public class GroupedClass {
         return t >= dtstart.getTime() && t <= dtend.getTime();
     }
 
-    public String formatPeriods() {
+    public String formatPeriods(Context ctx) {
         if (periods == null || periods.isEmpty()) return "";
-        if (periods.size() == 1) return periods.get(0) + "限";
+        if (periods.size() == 1) return ctx.getString(R.string.class_period_single, periods.get(0));
         List<Integer> sorted = new ArrayList<>(periods);
         Collections.sort(sorted);
-        return sorted.get(0) + "-" + sorted.get(sorted.size() - 1) + "限";
+        return ctx.getString(R.string.class_period_range, sorted.get(0), sorted.get(sorted.size() - 1));
     }
 
     // --- Static grouping logic ---

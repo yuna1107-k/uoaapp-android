@@ -49,10 +49,7 @@ public final class SeciossIdPClient {
     private static final int MAX_REDIRECTS = 10;
     private static final int MAX_RELAY_HOPS = 5;
 
-    /** OTP が実際に要求されたときだけ呼ばれる。UI 入力待ち・IMAP 自動取得などを差し替える。 */
-    public interface OtpCodeProvider {
-        @NonNull String provide() throws Exception;
-    }
+    // OTP の調達は OtpProvider (方式ごとの実体は OtpProviders が決める) に委ねる。
 
     public static final class Session {
         @NonNull public final String finalHtml;
@@ -64,12 +61,20 @@ public final class SeciossIdPClient {
         /** 最後のホップの HTTP ステータス。SP の 503 はメンテナンスページ (Moodle、2026-09-15 実測)。 */
         public final int finalStatus;
         @NonNull public final String cookieHeader;
+        /**
+         * cookieHeader の元になった SP の cookie を属性 (Domain / host-only / Path / 期限 / Secure) 込みで。
+         * 永続化はこちらを使う。"name=value" に潰すと、復元時にどのホスト・パスへ送るものか、いつ切れるかが
+         * 分からなくなる。最終ホップ (SP) のホストに送られうる未失効のものだけ。
+         */
+        @NonNull public final List<Cookie> spCookies;
 
-        Session(@NonNull String finalHtml, @NonNull String finalUrl, int finalStatus, @NonNull String cookieHeader) {
+        Session(@NonNull String finalHtml, @NonNull String finalUrl, int finalStatus, @NonNull String cookieHeader,
+                @NonNull List<Cookie> spCookies) {
             this.finalHtml = finalHtml;
             this.finalUrl = finalUrl;
             this.finalStatus = finalStatus;
             this.cookieHeader = cookieHeader;
+            this.spCookies = Collections.unmodifiableList(new ArrayList<>(spCookies));
         }
     }
 
@@ -111,8 +116,8 @@ public final class SeciossIdPClient {
     }
 
     private final String userAgent;
-    /** 全リクエストをこのプロキシ経由にする (OTP 登録を学内 SSH トンネル経由で行うため)。null なら直接。 */
-    @Nullable private final java.net.Proxy proxy;
+    /** 全リクエストをこのトンネル経由にする (OTP 登録を学内 SSH トンネル経由で行うため)。null なら直接。 */
+    @Nullable private final CampusSshTunnel tunnel;
 
     public SeciossIdPClient() {
         this(NetworkClient.getUserAgent(), null);
@@ -122,18 +127,18 @@ public final class SeciossIdPClient {
         this(userAgent, null);
     }
 
-    public SeciossIdPClient(@Nullable java.net.Proxy proxy) {
-        this(NetworkClient.getUserAgent(), proxy);
+    public SeciossIdPClient(@Nullable CampusSshTunnel tunnel) {
+        this(NetworkClient.getUserAgent(), tunnel);
     }
 
-    public SeciossIdPClient(@NonNull String userAgent, @Nullable java.net.Proxy proxy) {
+    public SeciossIdPClient(@NonNull String userAgent, @Nullable CampusSshTunnel tunnel) {
         this.userAgent = userAgent;
-        this.proxy = proxy;
+        this.tunnel = tunnel;
     }
 
     private okhttp3.OkHttpClient httpClient() {
         okhttp3.OkHttpClient base = NetworkClient.getNoRedirectClient();
-        return proxy == null ? base : base.newBuilder().proxy(proxy).build();
+        return tunnel == null ? base : tunnel.configure(base);
     }
 
     // ---- HTTP ----
@@ -209,9 +214,8 @@ public final class SeciossIdPClient {
                 // ストアに取り込んでしまう。ドメイン境界まで見る。
                 String hopHost = parsed.host().toLowerCase(java.util.Locale.ROOT);
                 if (hopHost.equals("secioss.com") || hopHost.endsWith(".secioss.com")) {
-                    Map<String, String> seciossCookies = new LinkedHashMap<>();
-                    for (Cookie c : received) seciossCookies.put(c.name(), c.value());
-                    if (!seciossCookies.isEmpty()) SeciossSsoStore.getInstance().merge(seciossCookies);
+                    // 属性 (path / expires) ごと渡す: ストアはセッション cookie と期限付き cookie を区別して保持する。
+                    SeciossSsoStore.getInstance().merge(hopHost, received);
                 }
                 String location = resp.header("Location");
                 if (resp.isRedirect() && location != null) {
@@ -230,7 +234,12 @@ public final class SeciossIdPClient {
                 return new HttpResult(resp.code(), currentUrl, decode(bytes), jar);
             }
         }
-        throw new IOException("too many redirects: " + url);
+        throw new TooManyRedirectsException(url);
+    }
+
+    /** 自前のリダイレクト追従が上限に達した。SSO を載せた入口でこれが出たら SSO を捨てて入り直す。 */
+    static final class TooManyRedirectsException extends IOException {
+        TooManyRedirectsException(String url) { super("too many redirects: " + url); }
     }
 
     /**
@@ -243,45 +252,46 @@ public final class SeciossIdPClient {
      * (同名・別ホストは共存する / 同名・同ホストは置き換わる) は SeciossCookieJarTest で固定している。
      */
     static void mergeCookies(@NonNull List<Cookie> jar, @NonNull List<Cookie> received) {
+        mergeCookies(jar, received, System.currentTimeMillis());
+    }
+
+    /**
+     * 共有の cookie jar (NetworkClient の HostScopedCookieJar) も同じ規則で動かすため public にしている。
+     *
+     * 期限切れの Set-Cookie は「削除指示」なので、古いものを消したうえで jar に積まない。ここを積んで
+     * いたため、SAML が使い捨てするリクエスト状態 cookie (_opensaml_req_ss:mem:<毎回別のID>) が削除されず
+     * 毎ホップ増殖し、削除済み cookie を送り返してサーバが状態不整合と判断 → SP と IdP の間で 302/307 が
+     * 延々ピンポンしてリダイレクト過多になっていた (2026-09-16 の iOS 実機ログで、1 ホップごとに
+     * request_bytes が 552→2810 と単調増加するのを確認)。動作する Python 参照 (http.cookiejar) は期限切れを
+     * 正しく捨てるため、同じサーバでも成功していた。
+     */
+    public static void mergeCookies(@NonNull List<Cookie> jar, @NonNull List<Cookie> received, long now) {
         for (Cookie c : received) {
             jar.removeIf(existing -> existing.name().equals(c.name())
                     && existing.domain().equals(c.domain()) && existing.path().equals(c.path()));
+            if (isExpired(c, now)) continue;
             jar.add(c);
         }
     }
 
-    /** jar のうち url に一致する cookie を "a=b; c=d" で返す。無ければ空文字。 */
+    /** サーバが「削除」を指示した cookie か。セッション cookie (persistent でない) は期限なし。 */
+    public static boolean isExpired(@NonNull Cookie cookie, long now) {
+        return cookie.persistent() && cookie.expiresAt() <= now;
+    }
+
+    /** jar のうち url に一致し、かつ期限切れでない cookie を "a=b; c=d" で返す。無ければ空文字。 */
     static String cookieHeaderFor(@NonNull List<Cookie> jar, @NonNull HttpUrl url) {
+        return cookieHeaderFor(jar, url, System.currentTimeMillis());
+    }
+
+    static String cookieHeaderFor(@NonNull List<Cookie> jar, @NonNull HttpUrl url, long now) {
         StringBuilder sb = new StringBuilder();
         for (Cookie c : jar) {
-            if (!c.matches(url)) continue;
+            if (!c.matches(url) || isExpired(c, now)) continue;
             if (sb.length() > 0) sb.append("; ");
             sb.append(c.name()).append('=').append(c.value());
         }
         return sb.toString();
-    }
-
-    /**
-     * SSO ストアの平文 cookie (secioss のもの) を、IdP ホストへ送られる cookie に仕立てる。
-     *
-     * ドメイン cookie (.secioss.com) ではなく、IdP ホスト限定 (host-only) で作る。slink.secioss.com が
-     * 出す cookie は Domain 属性なし = host-only で発行されるため (2026-09-07 の実機 HAR で AWSALB /
-     * AWSALBCORS / AWSALBTG / samsessid / auth_tkt / _saml_idp / _saml_sp / secioss_tenant 等 15 種すべてに
-     * Domain 属性なしを確認)、サーバ由来の新しい cookie を Cookie.parseAll すると domain は
-     * "slink.secioss.com" になる。seed を ".secioss.com" ドメインで作ると mergeCookies の (name, domain, path)
-     * 一致が崩れて古い seed 値が消えず、同名 cookie が 2 つ送られて ALB スティッキーをまた壊す。発行元と同じ
-     * host-only 表現で作れば、再ログイン時に古い seed が新しい値へ確実に置き換わる。SSO ストアは名前と値しか
-     * 保持しないので domain を復元できないが、この経路で踏む secioss ホストは slink のみ (他の *.secioss.com
-     * サブドメインを経由する導線は現状コード上に存在しない)。
-     */
-    static List<Cookie> seedSecioss(@NonNull Map<String, String> stored) {
-        List<Cookie> out = new ArrayList<>();
-        for (Map.Entry<String, String> e : stored.entrySet()) {
-            out.add(new Cookie.Builder()
-                    .name(e.getKey()).value(e.getValue())
-                    .hostOnlyDomain(IDP_HOST).path("/").build());
-        }
-        return out;
     }
 
     /**
@@ -291,6 +301,26 @@ public final class SeciossIdPClient {
     private static String sessionCookieHeader(@NonNull HttpResult result) {
         HttpUrl url = HttpUrl.parse(result.url);
         return url != null ? cookieHeaderFor(result.cookies, url) : "";
+    }
+
+    /** Session.spCookies。最終ホップのホストに送られうる (ドメイン一致の) 未失効の cookie。パスは問わない。 */
+    @NonNull
+    private static List<Cookie> sessionCookies(@NonNull HttpResult result) {
+        HttpUrl url = HttpUrl.parse(result.url);
+        return url != null ? cookiesForHost(result.cookies, url.host(), System.currentTimeMillis())
+                : Collections.<Cookie>emptyList();
+    }
+
+    @NonNull
+    static List<Cookie> cookiesForHost(@NonNull List<Cookie> jar, @NonNull String host, long now) {
+        List<Cookie> out = new ArrayList<>();
+        for (Cookie c : jar) {
+            if (isExpired(c, now)) continue;
+            if (com.shakenokirimi12.uoa_app.services.HostScopedCookieJar.domainMatches(c, host.toLowerCase(java.util.Locale.ROOT))) {
+                out.add(c);
+            }
+        }
+        return out;
     }
 
     /** UTF-8 として読めなければ Shift_JIS (iOS と同じ順序)。 */
@@ -355,12 +385,13 @@ public final class SeciossIdPClient {
         return value != null ? htmlUnescape(value) : null;
     }
 
+    /** &amp; は最後に戻す。先に戻すと "&amp;lt;" (本文としての "&lt;") が "<" まで二重に戻る (iOS と同じ順)。 */
     static String htmlUnescape(@NonNull String s) {
-        return s.replace("&amp;", "&")
-                .replace("&quot;", "\"")
+        return s.replace("&quot;", "\"")
                 .replace("&#39;", "'")
                 .replace("&lt;", "<")
-                .replace("&gt;", ">");
+                .replace("&gt;", ">")
+                .replace("&amp;", "&");
     }
 
     /**
@@ -462,6 +493,13 @@ public final class SeciossIdPClient {
         return resolved != null ? resolved.toString() : relative;
     }
 
+    /** 絶対 URL ならそのまま (正規化で形を変えない)。相対なら base で解決する。 */
+    @NonNull
+    static String absoluteAgainst(@NonNull String base, @NonNull String url) {
+        String t = url.trim().toLowerCase(java.util.Locale.ROOT);
+        return t.startsWith("https://") || t.startsWith("http://") ? url : resolve(base, url);
+    }
+
     private HttpResult followAutoSubmitRelays(@NonNull HttpResult start) throws IOException {
         HttpResult current = start;
         for (int i = 0; i < MAX_RELAY_HOPS; i++) {
@@ -490,43 +528,99 @@ public final class SeciossIdPClient {
 
     // ---- Login chain ----
 
+    /** 入口 (SSO を載せて叩いた SP の入口) が返した画面の種類。 */
+    enum EntryPage {
+        /** パスワードのログインフォーム (sessid / back / tenant がある)。 */
+        LOGIN_FORM,
+        /** OTP の入力画面 (FunctionID=allotplogin)。途中まで済んだ SSO を載せたときに返る。 */
+        OTP_FORM,
+        /** フォームが無い。SSO で通り、中継 (SAMLResponse の自動 submit) が返った。 */
+        NO_FORM,
+        /** sessid はあるが、ログインフォームの項目が揃っていない。 */
+        INCOMPLETE
+    }
+
+    @NonNull
+    static EntryPage classifyEntryPage(@NonNull String html) {
+        if (extractField("sessid", html) == null) return EntryPage.NO_FORM;
+        if ("allotplogin".equals(extractField("FunctionID", html))) return EntryPage.OTP_FORM;
+        if (extractField("back", html) != null && extractField("tenant", html) != null) return EntryPage.LOGIN_FORM;
+        return EntryPage.INCOMPLETE;
+    }
+
     private static final class PostPasswordState {
         @NonNull final HttpResult result;
         @Nullable final String functionId;
+        /** パスワードを送って、IdP が受け付けた (SSO だけで通ったときは false)。 */
+        final boolean passwordAccepted;
 
-        PostPasswordState(@NonNull HttpResult result, @Nullable String functionId) {
+        PostPasswordState(@NonNull HttpResult result, @Nullable String functionId, boolean passwordAccepted) {
             this.result = result;
             this.functionId = functionId;
+            this.passwordAccepted = passwordAccepted;
         }
     }
 
     /**
      * entry -> tenantlogin.cgi (ID/PW POST) -> back の追跡 (+ 中継フォームの追従) までを行う。
-     * login() と beginOtpRegistration() の共通部分。
+     * login() と beginOtpRegistrationOnCampus() の共通部分。
      */
     private PostPasswordState authenticateUpToOtpDecision(@NonNull String entryUrl, @NonNull String uid,
                                                           @NonNull String pass, boolean useStoredSso)
             throws SeciossError, IOException {
         // 保持している SSO セッションを載せて入口を叩く。IdP 側で生きていれば、ログインフォームでは
         // なく SAMLResponse の自動 submit が返ってきて、パスワードも OTP も要求されずに SP へ戻れる。
-        List<Cookie> initialCookies = useStoredSso
-                ? seedSecioss(SeciossSsoStore.getInstance().current()) : Collections.emptyList();
-        HttpResult entry = get(entryUrl, initialCookies, Collections.emptyMap());
+        // SSO は持ち主ごと。別アカウントのものなら捨て、ここから受け取る分は uid のものとする
+        // (SSO を載せない経路でも受け取った cookie はストアに入るので、同じく記録する)。
+        SeciossSsoStore sso = SeciossSsoStore.getInstance();
+        sso.claimFor(uid);
+        List<Cookie> initialCookies = useStoredSso ? sso.current() : Collections.<Cookie>emptyList();
+        HttpResult entry;
+        try {
+            entry = get(entryUrl, initialCookies, Collections.emptyMap());
+        } catch (TooManyRedirectsException e) {
+            if (initialCookies.isEmpty()) throw e;
+            // 載せた SSO を IdP が受け付けず、IdP 内でリダイレクトが回った (IdP 側で失効したチケットを
+            // 再生すると 307 → 302 → 302 が続く、2026-09-16)。SSO を捨ててパスワードから 1 回だけ入り直す。
+            // 捨てないと、セッション cookie が消えるまでの最大 1 時間、同じ失敗を繰り返す。
+            android.util.Log.w("SeciossIdPClient", "entry looped with stored SSO; clearing it and retrying from the password");
+            sso.clear();
+            sso.claimFor(uid);
+            entry = get(entryUrl, Collections.emptyList(), Collections.emptyMap());
+        }
         if (entry.status != 200) {
             throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, entry.status, "entry page (" + entryUrl + ")");
         }
-        if (extractField("sessid", entry.html) == null) {
+        EntryPage page = classifyEntryPage(entry.html);
+        if ((page == EntryPage.OTP_FORM || page == EntryPage.INCOMPLETE) && !initialCookies.isEmpty()) {
+            // 載せた SSO が「パスワードは通ったが OTP が済んでいない」途中のセッションだと、IdP は
+            // ログインフォームではなく OTP の入力画面 (tenant が無い) を返す。前回のログインで OTP の
+            // 取得に失敗した直後 (SSO のセッション cookie は最大 1 時間残る) にここへ来て、以前は
+            // MISSING_FIELD (「IdP のログイン画面が見つかりませんでした」) で止まっていた (2026-10-23、
+            // Android のテスターから報告。原因はコードからの推定で、実アカウントでは未確認)。
+            // ループのときと同じく SSO を捨て、パスワードから 1 回だけ入り直す。
+            android.util.Log.w("SeciossIdPClient", "entry with stored SSO returned " + page + "; clearing it and retrying from the password");
+            sso.clear();
+            sso.claimFor(uid);
+            entry = get(entryUrl, Collections.emptyList(), Collections.emptyMap());
+            if (entry.status != 200) {
+                throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, entry.status, "entry page (" + entryUrl + ")");
+            }
+            page = classifyEntryPage(entry.html);
+        }
+        if (page == EntryPage.NO_FORM) {
             // ログインフォームが無い = 既存の SSO セッションで通った可能性が高い。中継を追って SP まで
             // 戻す。想定と違う画面なら、呼び出し側 (成功マーカー / ホスト検証) が弾く。
             HttpResult passthrough = followAutoSubmitRelays(entry);
-            return new PostPasswordState(passthrough, extractField("FunctionID", passthrough.html));
+            return new PostPasswordState(passthrough, extractField("FunctionID", passthrough.html), false);
+        }
+        if (page != EntryPage.LOGIN_FORM) {
+            throw new SeciossError(SeciossError.Kind.MISSING_FIELD,
+                    "sessid/back/tenant on login form, FunctionID=" + extractField("FunctionID", entry.html));
         }
         String sessid = extractField("sessid", entry.html);
         String back = extractField("back", entry.html);
         String tenant = extractField("tenant", entry.html);
-        if (sessid == null || back == null || tenant == null) {
-            throw new SeciossError(SeciossError.Kind.MISSING_FIELD, "sessid/back/tenant on login form");
-        }
 
         String loginBody = "dummy=&username=" + urlEncode(uid) + "&tenant=" + urlEncode(tenant)
                 + "&password=" + urlEncode(pass) + "&op=login&back=" + urlEncode(back) + "&sessid=" + sessid;
@@ -540,7 +634,10 @@ public final class SeciossIdPClient {
             throw new SeciossError(SeciossError.Kind.INVALID_CREDENTIALS);
         }
 
-        HttpResult after = get(back, login.cookies, Collections.singletonMap("Referer", TENANT_LOGIN_URL));
+        // back は実測では絶対 URL。相対で返されても追えるよう、iOS と同じく tenantlogin.cgi を基準に解決する
+        // (送り返す値は IdP が出したまま)。
+        HttpResult after = get(absoluteAgainst(TENANT_LOGIN_URL, back), login.cookies,
+                Collections.singletonMap("Referer", TENANT_LOGIN_URL));
         if (after.status != 200) {
             throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, after.status, "post-login back");
         }
@@ -548,18 +645,46 @@ public final class SeciossIdPClient {
         if (relayed.html.contains(SESSION_TIMED_OUT_MARKER)) {
             throw new SeciossError(SeciossError.Kind.SESSION_TIMED_OUT);
         }
-        return new PostPasswordState(relayed, extractField("FunctionID", relayed.html));
+        return new PostPasswordState(relayed, extractField("FunctionID", relayed.html), true);
     }
 
     /**
      * otpCode を呼んでコードを取得し、送信して完了させる。学内アクセス相当で OTP 自体が要求されなかった
      * 場合は otpCode を呼ばずに完了する。OTP 未設定の場合は OTP_NOT_CONFIGURED を投げる (このクライアントは
-     * 登録操作をしない。登録が必要なら beginOtpRegistration を使うこと)。
+     * 登録操作をしない。登録が必要なら beginOtpRegistrationOnCampus を使うこと)。
      */
     @NonNull
     public Session login(@NonNull String entryUrl, @NonNull String uid, @NonNull String pass,
-                         @NonNull OtpCodeProvider otpCode) throws Exception {
-        PostPasswordState state = authenticateUpToOtpDecision(entryUrl, uid, pass, true);
+                         @NonNull OtpProvider otp) throws Exception {
+        // サービスをまたいで IdP へのログインを 1 本にする。2 本目は 1 本目が保存した SSO で入る (IdpLoginGate)。
+        return IdpLoginGate.shared().run(() -> loginExclusively(entryUrl, uid, pass, otp, false));
+    }
+
+    /**
+     * 資格情報の確認のためのログイン (設定のアカウントのダイアログ・初期設定)。保存している SSO を載せず、必ず
+     * pass を tenantlogin.cgi に POST する。SSO を載せると IdP がそれだけで通し (パスワードを送らない)、
+     * 打ち間違えた新しいパスワードを確かめないまま保存してしまう。受け取った SSO は通常どおり保存するので、
+     * 確認のあとの同期は OTP をもう一度求めずにそれで入れる。メール方式では OTP メールが 1 通飛ぶ
+     * (利用者が資格情報を変えているので許す)。
+     */
+    @NonNull
+    public Session loginVerifyingPassword(@NonNull String entryUrl, @NonNull String uid, @NonNull String pass,
+                                          @NonNull OtpProvider otp) throws Exception {
+        return IdpLoginGate.shared().run(() -> loginExclusively(entryUrl, uid, pass, otp, true));
+    }
+
+    @NonNull
+    private Session loginExclusively(@NonNull String entryUrl, @NonNull String uid, @NonNull String pass,
+                                     @NonNull OtpProvider otp, boolean verifyPassword) throws Exception {
+        // IdpLoginGate で待っている間に、先のログインが ID / パスワードの誤りを見つけた・鍵を止めた等なら、
+        // パスワードを送らずに終える (OtpProvider.beforeLogin)。
+        otp.beforeLogin();
+        PostPasswordState state = authenticateUpToOtpDecision(entryUrl, uid, pass, !verifyPassword);
+        if (verifyPassword && !state.passwordAccepted) {
+            // SSO を載せずに入って、パスワードの画面を通らなかった。確かめられていないので成功にしない。
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE, "verification login did not post the password");
+        }
+        if (state.passwordAccepted) LoginEvidence.notePasswordAccepted();
         HttpResult current = state.result;
 
         if (current.html.contains(OTP_NOT_CONFIGURED_MARKER)) {
@@ -577,7 +702,8 @@ public final class SeciossIdPClient {
                         "post-login screen(FunctionID=" + state.functionId + ", url=" + current.url + ") "
                                 + visibleExcerpt(current.html, 400));
             }
-            return new Session(current.html, current.url, current.status, sessionCookieHeader(current));
+            return new Session(current.html, current.url, current.status, sessionCookieHeader(current),
+                    sessionCookies(current));
         }
 
         String otpSessid = extractField("sessid", current.html);
@@ -587,66 +713,230 @@ public final class SeciossIdPClient {
             throw new SeciossError(SeciossError.Kind.MISSING_FIELD, "sessid/back/username on OTP form");
         }
 
-        // メール OTP の送信 (motprefresh=0)。Authenticator アプリ方式ではこのステップ自体を使わない。
-        String motpBody = "username=" + urlEncode(otpUsername) + "&sessid=" + otpSessid + "&motprefresh=0";
-        HttpResult motp = postForm(MOTP_URL, motpBody, current.cookies, current.url);
-        if (motp.status != 200) {
-            throw new SeciossError(SeciossError.Kind.OTP_REQUEST_FAILED);
+        // 方式は IdP 側の登録が正。この画面の otp_type で選ぶ (読めなければ控え。OtpProviders)。
+        String otpType = otpType(current.html);
+        // otp_type が書かれていない画面は、形 (欄と変数の名前だけ) を診断に送る (同じ形は 1 日 1 回)。認証アプリ方式の画面の中身はまだ確かめていない。
+        if (otpType == null || NO_MAIL_DISPATCH_OTP_TYPE.equals(otpType)) reportOtpPageShape(current.html);
+        OtpProvider provider = otp.forOtpPage(otpType);
+        try {
+            return submitOtp(provider, current, otpSessid, otpBack, otpUsername);
+        } finally {
+            provider.release();
+        }
+    }
+
+    @NonNull
+    private Session submitOtp(@NonNull OtpProvider provider, @NonNull HttpResult current, @NonNull String otpSessid,
+                              @NonNull String otpBack, @NonNull String otpUsername) throws Exception {
+        // メール方式のときだけ送信を要求する (motprefresh=0)。認証アプリ方式はこのステップを使わない。
+        HttpResult motp = current;
+        if (provider.requiresMailDispatch()) {
+            // 送ってよいかは送る前に決める (バックグラウンドの 6 時間の枠など)。送ったあとで止めても遅い。
+            provider.beforeMailDispatch();
+            String motpBody = "username=" + urlEncode(otpUsername) + "&sessid=" + urlEncode(otpSessid)
+                    + "&motprefresh=0";
+            motp = postForm(MOTP_URL, motpBody, current.cookies, current.url);
+            if (motp.status != 200) {
+                throw new SeciossError(SeciossError.Kind.OTP_REQUEST_FAILED);
+            }
         }
 
-        String code = otpCode.provide();
+        // 保存したシークレットで作ったコードが弾かれたら、戻された OTP の入力画面から次の窓で 1 回だけやり直す
+        // (OtpProvider.retriesRejectedCode)。同じ窓を PC への中継や別のログインが先に使っていた、窓の境目で切れた、
+        // などで正しい鍵でも弾かれうる。2 回続けて弾かれたら onRejected (鍵を止める)。
+        HttpResult form = motp;
+        String referer = current.url;
+        HttpResult relayed;
+        for (int attempt = 0; ; attempt++) {
+            String code = provider.code();
 
-        String otpBody = "dummy=&username=" + urlEncode(otpUsername) + "&password=" + urlEncode(code)
-                + "&op=login&back=" + urlEncode(otpBack) + "&sessid=" + otpSessid;
-        HttpResult verify = postForm(ALL_OTP_LOGIN_URL, otpBody, motp.cookies, current.url);
-        if (verify.status != 200) {
-            throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, verify.status,
-                    "allotplogin.cgi(コードが間違っていた可能性も含む)");
-        }
+            String otpBody = "dummy=&username=" + urlEncode(otpUsername) + "&password=" + urlEncode(code)
+                    + "&op=login&back=" + urlEncode(otpBack) + "&sessid=" + otpSessid;
+            HttpResult verify = postForm(ALL_OTP_LOGIN_URL, otpBody, form.cookies, referer);
+            if (verify.status != 200) {
+                throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, verify.status,
+                        "allotplogin.cgi(コードが間違っていた可能性も含む)");
+            }
 
-        HttpResult fin = get(otpBack, verify.cookies, Collections.singletonMap("Referer", ALL_OTP_LOGIN_URL));
-        if (fin.status != 200) {
-            throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, fin.status, "post-OTP back");
+            HttpResult fin = get(absoluteAgainst(ALL_OTP_LOGIN_URL, otpBack), verify.cookies, Collections.singletonMap("Referer", ALL_OTP_LOGIN_URL));
+            if (fin.status != 200) {
+                throw new SeciossError(SeciossError.Kind.UNEXPECTED_STATUS, fin.status, "post-OTP back");
+            }
+            relayed = followAutoSubmitRelays(fin);
+            // otpCode の待ち時間 (IMAP 自動取得は最大 30 秒) を挟むため、ここでのタイムアウトが一番起こりやすい。
+            if (relayed.html.contains(SESSION_TIMED_OUT_MARKER)) {
+                throw new SeciossError(SeciossError.Kind.SESSION_TIMED_OUT);
+            }
+            // OTP の入力画面へ戻された = コードが違うか期限切れ (iOS の IdPClient と同じ見分け方)。
+            boolean rejected = relayed.url.contains("/pub/allotplogin.cgi")
+                    || "allotplogin".equals(extractField("FunctionID", relayed.html));
+            if (!rejected) break;
+            if (attempt == 0 && provider.retriesRejectedCode()) {
+                String sessid = extractField("sessid", relayed.html);
+                String back = extractField("back", relayed.html);
+                String user = extractField("username", relayed.html);
+                if (sessid == null || back == null || user == null) {
+                    // やり直せない。1 回弾かれただけでは鍵を止めない (onRejected は呼ばない)。
+                    throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                            "OTP form after a rejected stored-key code lacks sessid/back/username");
+                }
+                android.util.Log.i("SeciossIdPClient", "stored-key OTP rejected; retrying once with the next step");
+                otpSessid = sessid;
+                otpBack = back;
+                otpUsername = user;
+                form = relayed;
+                referer = relayed.url;
+                continue;
+            }
+            provider.onRejected();
+            throw new SeciossError(SeciossError.Kind.INVALID_OTP);
         }
-        HttpResult relayed = followAutoSubmitRelays(fin);
-        // otpCode の待ち時間 (IMAP 自動取得は最大 30 秒) を挟むため、ここでのタイムアウトが一番起こりやすい。
-        if (relayed.html.contains(SESSION_TIMED_OUT_MARKER)) {
-            throw new SeciossError(SeciossError.Kind.SESSION_TIMED_OUT);
-        }
-        return new Session(relayed.html, relayed.url, relayed.status, sessionCookieHeader(relayed));
+        provider.onAccepted();
+        return new Session(relayed.html, relayed.url, relayed.status, sessionCookieHeader(relayed),
+                sessionCookies(relayed));
+    }
+
+    public enum OtpStatus {
+        /** パスワード後に「ワンタイムパスワード設定が行われていません」(auth_err_020)。学外からの判定。 */
+        NOT_CONFIGURED,
+        /** OTP 入力フォーム (allotplogin) が出た = 設定済み。 */
+        CONFIGURED,
+        /** OTP を挟まずポータルまで通った (学内アクセス)。設定済みかどうかはこれだけでは分からない。 */
+        REACHED_PORTAL
+    }
+
+    private static boolean reachedPortal(@NonNull PostPasswordState state) {
+        return "menu".equals(state.functionId)
+                || state.result.url.contains("index.php")
+                || state.result.html.contains("ログアウト")
+                || state.result.html.contains("Logout");
     }
 
     /**
-     * OTP 未設定のアカウントに対して、新規登録 (または 1 方式設定済みなら追加登録) の準備をする。
-     * ログイン時に OTP を要求される (= 既に設定済み) アカウントでは OTP_ALREADY_CONFIGURED を投げる。
-     * 学内ネットワークからのアクセスでない場合、SECIOSS 側の仕様でこの先の登録操作自体が通らない
-     * (アプリ側はこれを回避しようとはしない)。
+     * 通常経路 (学外) からパスワードだけで入り、OTP の設定状況を見る。SSO セッションを載せると IdP が
+     * パスワード画面ごと飛ばしてしまい判定できないので、ここだけは必ずパスワードから入る
+     * (2026-09-15 エミュレータで実測)。
      */
     @NonNull
-    public SeciossRegistrationSession beginOtpRegistration(@NonNull String entryUrl, @NonNull String uid,
-                                                           @NonNull String pass) throws Exception {
-        // OTP の設定状況はパスワード直後の画面でしか分からない。SSO セッションを載せると IdP が
-        // そこを飛ばしてポータルのメニュー (FunctionID=menu) へ通してしまい、判定できない
-        // (2026-09-15 エミュレータで実測)。ここだけは必ずパスワードから入る。
+    public OtpStatus checkOtpStatus(@NonNull String entryUrl, @NonNull String uid, @NonNull String pass) throws Exception {
         PostPasswordState state = authenticateUpToOtpDecision(entryUrl, uid, pass, false);
-        if (!state.result.html.contains(OTP_NOT_CONFIGURED_MARKER)) {
-            // OTP 要求フォーム (allotplogin) が出た = 既に設定済み。
-            if ("allotplogin".equals(state.functionId)) {
-                throw new SeciossError(SeciossError.Kind.OTP_ALREADY_CONFIGURED);
-            }
-            // 学内アクセス (SSH トンネル) だと OTP を挟まずポータル (FunctionID=menu / index.php) まで
-            // 通ることがある。そこまで通れたなら、このアカウントは既に使える状態 = 追加設定は不要。
-            boolean reachedPortal = "menu".equals(state.functionId)
-                    || state.result.url.contains("index.php")
-                    || state.result.html.contains("ログアウト")
-                    || state.result.html.contains("Logout");
-            if (reachedPortal) {
-                throw new SeciossError(SeciossError.Kind.OTP_ALREADY_CONFIGURED);
-            }
-            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
-                    "registration entry screen(FunctionID=" + state.functionId + ")");
+        if (state.result.html.contains(OTP_NOT_CONFIGURED_MARKER)) return OtpStatus.NOT_CONFIGURED;
+        if ("allotplogin".equals(state.functionId)) return OtpStatus.CONFIGURED;
+        if (reachedPortal(state)) return OtpStatus.REACHED_PORTAL;
+        throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                "registration entry screen(FunctionID=" + state.functionId + ", url=" + state.result.url + ")");
+    }
+
+    /**
+     * 通常経路 (学外) からパスワードだけで入り、OTP 入力画面 (allotplogin) の otp_type を返す。
+     * メールの送信は頼まない (送信は motp.cgi への POST で、ここでは呼ばない)。OTP 入力画面に
+     * 着かなかった (学内にいてポータルまで通った等) か、値が無ければ null。
+     */
+    @Nullable
+    public String readOtpType(@NonNull String entryUrl, @NonNull String uid, @NonNull String pass) throws Exception {
+        PostPasswordState state = authenticateUpToOtpDecision(entryUrl, uid, pass, false);
+        if (!"allotplogin".equals(state.functionId)) return null;
+        return otpType(state.result.html);
+    }
+
+    /**
+     * OTP 入力画面 (allotplogin.cgi) が JS に書く、アカウントの OTP 方式 (var otp_type = '...')。
+     * メール方式のアカウントで 'mail' (2026-09-07 の HAR と uoa-unofficial-extension の
+     * fixtures/idp/allotplogin.html で確認)。認証アプリ方式のアカウントで出る値は未確認なので、
+     * 値の解釈は呼び出し側に任せ、書かれている文字列をそのまま返す (iOS の IdPPageParser.otpType と同じ)。
+     * <p>
+     * otp_type が無いときは、メールを送る仕組みがあるかで分ける (SPEC.md 3.1)。メール方式の画面は、開くとすぐ
+     * motp.cgi にメールを頼む (doSend。otp_type もその中で使う)。その仕組みが無い OTP 画面ではメールのコードは
+     * 使えないので {@link #NO_MAIL_DISPATCH_OTP_TYPE} を返す (認証アプリ方式とみなす)。仕組みがあるのに読めなければ null。
+     * 2026-10-30、設定済みの認証アプリのアカウントで otp_type が読めず、メール方式として扱ってログインに失敗していた。
+     */
+    @Nullable
+    static String otpType(@NonNull String html) {
+        String value = firstGroup("var\\s+otp_type\\s*=\\s*['\"]([^'\"]*)['\"]", html);
+        if (value != null) return value;
+        return hasMailDispatch(html) ? null : NO_MAIL_DISPATCH_OTP_TYPE;
+    }
+
+    /** メールを送る仕組み (motp.cgi) があるか。大文字小文字は区別しない。iOS の hasMailDispatch と同じ。 */
+    private static boolean hasMailDispatch(@NonNull String html) {
+        return html.toLowerCase(java.util.Locale.ROOT).contains("motp.cgi");
+    }
+
+    /** otp_type が無く、メールを送る仕組みも無い OTP 画面 (otpType を参照)。OtpMethod.fromOtpType で認証アプリになる。 */
+    static final String NO_MAIL_DISPATCH_OTP_TYPE = "no-mail-dispatch";
+
+    /**
+     * 診断用の OTP 画面の形。入力欄の name と、JS の var の名前と、メールを送る仕組みの有無だけで、値は入れない
+     * (sessid やユーザー名を送らない)。otp_type が読めない画面の中身を確かめるのに使う。iOS の otpPageShape と同じ。
+     */
+    @NonNull
+    static String otpPageShape(@NonNull String html) {
+        java.util.TreeSet<String> inputs = names("(?i)<(?:input|button|select)[^>]*(?<![-\\w])(?:name|id)\\s*=\\s*['\"]([A-Za-z0-9_\\-]+)['\"]", html);
+        java.util.TreeSet<String> vars = names("\\bvar\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*=", html);
+        String shape = "motp=" + (hasMailDispatch(html) ? 1 : 0) + ";inputs=" + String.join(",", inputs)
+                + ";vars=" + String.join(",", vars);
+        return shape.length() > 400 ? shape.substring(0, 400) : shape;
+    }
+
+    private static java.util.TreeSet<String> names(String pattern, String html) {
+        java.util.TreeSet<String> out = new java.util.TreeSet<>();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern).matcher(html);
+        while (m.find()) {
+            String name = m.group(1);
+            out.add(name.length() > 30 ? name.substring(0, 30) : name);
         }
-        // iOS と同じく、登録セッションは空の cookie から始める (ユーザーポータル側で改めて確立される)。
-        return new SeciossRegistrationSession(this, new ArrayList<>());
+        return out;
+    }
+
+    /** otp_type が書かれていない画面の形を診断に送る。送れなくてもログインは続ける (単体テストでは android の API が使えない)。 */
+    private static void reportOtpPageShape(@NonNull String html) {
+        try {
+            String shape = otpPageShape(html);
+            if (!com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.enabled()
+                    || !com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.claimOtpPageShape(shape)) return;
+            com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.sendAsync(java.util.Collections.singletonList(
+                    com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.event("IdPOtpPage", null,
+                            com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.CONTEXT_LOGIN, "unknown",
+                            com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.supportId(),
+                            java.util.Collections.emptyMap(), shapeExtra(shape), java.util.Collections.emptyList(),
+                            com.shakenokirimi12.uoa_app.services.diagnostics.OtpDiagnostics.Build.current(),
+                            System.currentTimeMillis())));
+        } catch (RuntimeException e) {
+            // 上の理由で握る。ログインの結果には関わらない。
+        }
+    }
+
+    private static com.google.gson.JsonObject shapeExtra(String shape) {
+        com.google.gson.JsonObject extra = new com.google.gson.JsonObject();
+        extra.addProperty("shape", shape);
+        return extra;
+    }
+
+    /**
+     * 学内アクセス (このクライアントが CampusSshTunnel 付きで作られている前提) でパスワード
+     * ログインし、ユーザーポータルに着いた jar で登録セッションを始める。
+     *
+     * 登録画面 (/user/index.php?app=motpmail 等) は sso/authorization.php を経由してログインセッション
+     * (auth_tkt / samsessid) を要求する。空の cookie で叩くと tenantlogin に戻され「csrf が無い」で落ちる
+     * (2026-09-19 に iOS 側の idp_verification/test_idp_full_auto.swift のトレースで確認)。学外の通常経路だと
+     * 同じ画面が auth_err_020 に落ちるので、登録は必ず学内経路で行う。
+     */
+    @NonNull
+    public SeciossRegistrationSession beginOtpRegistrationOnCampus(@NonNull String entryUrl, @NonNull String uid,
+                                                                   @NonNull String pass) throws Exception {
+        PostPasswordState state = authenticateUpToOtpDecision(entryUrl, uid, pass, false);
+        if (state.result.html.contains(OTP_NOT_CONFIGURED_MARKER)) {
+            // 学内経路のはずなのに学外扱い = トンネルが効いていない。
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                    "on-campus login still asked for OTP setup (tunnel not effective?)");
+        }
+        if ("allotplogin".equals(state.functionId)) {
+            throw new SeciossError(SeciossError.Kind.OTP_ALREADY_CONFIGURED);
+        }
+        if (!reachedPortal(state)) {
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                    "on-campus login did not reach the portal(FunctionID=" + state.functionId + ", url=" + state.result.url + ")");
+        }
+        return new SeciossRegistrationSession(this, new ArrayList<>(state.result.cookies));
     }
 }

@@ -1,7 +1,6 @@
 package com.shakenokirimi12.uoa_app;
 
 import android.content.Intent;
-import android.net.Uri;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
@@ -18,23 +17,39 @@ import com.google.android.material.bottomnavigation.BottomNavigationView;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.AppConfig;
 import com.shakenokirimi12.uoa_app.services.AppConfigService;
+import com.shakenokirimi12.uoa_app.services.ForceUpdateGate;
+import com.shakenokirimi12.uoa_app.ui.ForceUpdateActivity;
 import com.shakenokirimi12.uoa_app.services.sync.SyncScheduler;
 import com.shakenokirimi12.uoa_app.services.LocationGeofenceService;
 import com.shakenokirimi12.uoa_app.services.PushNotificationService;
 import com.shakenokirimi12.uoa_app.ui.onboarding.OnboardingActivity;
 import com.shakenokirimi12.uoa_app.ui.util.EdgeToEdge;
 
-public class MainActivity extends AppCompatActivity {
+public class MainActivity extends AppCompatActivity
+        implements com.shakenokirimi12.uoa_app.ui.idp.OtpReregistrationHost {
+    /** 時間割共有の受け取り画面 (TimetableIncomingActivity) の「保存した時間割を見る」。値は友達の ID。 */
+    public static final String EXTRA_OPEN_TIMETABLE_FRIEND = "open_timetable_friend";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // 強制アップデートの対象なら、端末登録や同期の予約を始める前に全面表示へ差し替える。
+        if (ForceUpdateGate.getInstance(this).isBlocked()) {
+            ForceUpdateActivity.show(this);
+            return;
+        }
 
         PreferenceManager prefs = PreferenceManager.getInstance(this);
         if (!prefs.isOnboardingDone()) {
             startActivity(new Intent(this, OnboardingActivity.class));
             finish();
             return;
+        }
+        // 初期設定を終えた人に、アップデートで増えた段だけを上に出す。作り直し (回転・プロセスの復元) では出し直さない。
+        if (savedInstanceState == null
+                && !com.shakenokirimi12.uoa_app.ui.onboarding.OnboardingProgress.newSteps(prefs).isEmpty()) {
+            startActivity(OnboardingActivity.catchUp(this));
         }
 
         setContentView(R.layout.activity_main);
@@ -49,6 +64,12 @@ public class MainActivity extends AppCompatActivity {
         // タブ構成を変えたときは refreshBottomTabs() でメニュー項目だけ差し替える (再結線しない)。
         com.shakenokirimi12.uoa_app.ui.util.MainTabs.applyTo(bottomNav, PreferenceManager.getInstance(this));
         NavigationUI.setupWithNavController(bottomNav, navController);
+        // 選んでいるタブをもう一度押したら、そのタブの最初の画面へ戻す。リスナーが無いと NavigationUI が
+        // 同じタブへ遷移し直すだけで、「その他」から開いた画面 (成績など) から「その他」へ戻れなかった。
+        bottomNav.setOnItemReselectedListener(item -> {
+            if (navigationLocked) return;
+            navController.popBackStack(item.getItemId(), false);
+        });
         com.google.android.material.appbar.MaterialToolbar toolbar = findViewById(R.id.toolbar);
         // 上バーの「戻る」はタブの根では出さない。どのタブが下に出ていても根として扱えるよう、
         // 取りうるタブの遷移先すべて (+その他) をトップレベルにしておく。こうすればタブ構成を
@@ -57,10 +78,34 @@ public class MainActivity extends AppCompatActivity {
                 new androidx.navigation.ui.AppBarConfiguration.Builder(
                         com.shakenokirimi12.uoa_app.ui.util.MainTabs.allRootDestinationIds()).build();
         NavigationUI.setupWithNavController(toolbar, navController, appBarConfiguration);
+        // ただし下タブに無い画面 (「その他」から開いた成績など) は、根でも「戻る」を出す。出さないと
+        // 「その他」へ戻る手段が下タブの再選択しか無い。NavigationUI の後に登録して、そちらが外した
+        // 矢印を付け直す。押したときは NavigationUI の navigateUp が前の画面 (その他) へ戻す。
+        navController.addOnDestinationChangedListener((controller, destination, arguments) -> {
+            if (navigationLocked || controller.getPreviousBackStackEntry() == null) return;
+            if (!com.shakenokirimi12.uoa_app.ui.util.MainTabs.isHiddenTabRoot(
+                    destination.getId(), PreferenceManager.getInstance(this))) return;
+            androidx.appcompat.graphics.drawable.DrawerArrowDrawable arrow =
+                    new androidx.appcompat.graphics.drawable.DrawerArrowDrawable(toolbar.getContext());
+            arrow.setProgress(1f);
+            toolbar.setNavigationIcon(arrow);
+            toolbar.setNavigationContentDescription(androidx.navigation.ui.R.string.nav_app_bar_navigate_up_description);
+        });
+        // 利用状況: 画面を開いた回数を数える。登録した時点の画面 (起動時の最初の画面) にも呼ばれる。
+        // 回転などで作り直したときは、同じ画面をもう一度数えないよう最初の 1 回を飛ばす。
+        final boolean[] skipRestoredDestination = {savedInstanceState != null};
+        navController.addOnDestinationChangedListener((controller, destination, arguments) -> {
+            if (skipRestoredDestination[0]) {
+                skipRestoredDestination[0] = false;
+                return;
+            }
+            String feature = usageFeatureFor(destination.getId());
+            if (feature != null) com.shakenokirimi12.uoa_app.services.usage.UsageStats.record(this, feature);
+        });
         EdgeToEdge.apply(this, findViewById(R.id.container), bottomNav);
 
-        // CampusSquare は 2026-09-15 以降 IdP 経由しか無い (旧フォーム消滅)。OTP メール自動取得の同意を
-        // 含むチュートリアルを、この端末でまだ見せていなければリモート設定を待たずに初回起動で出す
+        // CampusSquare は 2026-09-15 以降 IdP 経由しか無い (旧フォーム消滅)。ワンタイムパスワードの
+        // 受け取り方の説明を含むチュートリアルを、この端末でまだ見せていなければリモート設定を待たずに初回起動で出す
         // (iOS の idPTutorialPresented と同じ)。回転などの再生成では出し直さない。
         if (savedInstanceState == null && !prefs.hasSeenIdPTutorial()) {
             navController.navigate(R.id.navigation_idp_tutorial);
@@ -80,30 +125,58 @@ public class MainActivity extends AppCompatActivity {
 
         // debug ビルド限定: adb から OTP 登録画面 (SSH トンネル経由) を直接開いて確認するための入口。
         //   adb shell am start -n com.shakenokirimi12.uoa_app/.MainActivity --ez open_otp_registration true
-        // 本番では設定画面からの導線を持たず、ログイン時の OTP 未設定検知でしか開かない。
+        // 本番で新規登録として開くのは、ログイン時の OTP 未設定検知だけ (設定画面からは方式の切り替えとして開く)。
         if (BuildConfig.DEBUG && savedInstanceState == null
                 && getIntent() != null && getIntent().getBooleanExtra("open_otp_registration", false)) {
             openOtpRegistration();
         }
 
+        if (savedInstanceState == null) openTimetableFriend(getIntent());
+
         // Start geofencing if enabled
-        if (prefs.isAutoAttendanceEnabled()) {
-            LocationGeofenceService.startGeofencing(this, 37.5234, 139.9388, 200);
-        }
+        LocationGeofenceService.startIfEnabled(this);
 
         setupRemoteConfig();
         SyncScheduler.schedule(this);
+        com.shakenokirimi12.uoa_app.services.notification.LunchMenuWorker.ensureScheduled(this);
+    }
+
+    /** 画面 (nav_graph の行き先) と、利用状況で数える機能の名前。数えない画面は null。 */
+    @androidx.annotation.Nullable
+    private static String usageFeatureFor(int destinationId) {
+        if (destinationId == R.id.navigation_home) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.HOME;
+        if (destinationId == R.id.navigation_calendar) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.CALENDAR;
+        if (destinationId == R.id.navigation_courses) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.COURSES;
+        if (destinationId == R.id.navigation_course_detail) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.COURSE_DETAIL;
+        if (destinationId == R.id.navigation_assignment_detail) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.ASSIGNMENT_DETAIL;
+        if (destinationId == R.id.navigation_grades) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.GRADES;
+        if (destinationId == R.id.navigation_gakushoku) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.GAKUSHOKU;
+        if (destinationId == R.id.navigation_facilities) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.FACILITY_USAGE;
+        if (destinationId == R.id.navigation_syllabus) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.SYLLABUS;
+        if (destinationId == R.id.navigation_settings) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.SETTINGS;
+        if (destinationId == R.id.navigation_otp_relay) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.OTP_RELAY;
+        if (destinationId == R.id.navigation_timetable_friends) return com.shakenokirimi12.uoa_app.services.usage.UsageFeature.TIMETABLE_SHARE;
+        return null;
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        // 前面復帰のたびに取り直す。メンテナンス解除や killswitch の変更を、
-        // アプリを起動し直さなくても拾えるようにする (iOS と同じタイミング)。
-        AppConfigService.getInstance().refresh(this);
+        // リモート設定の取り直しは、アプリが前面に出るたびに UoaApplication が行う (どの画面から戻っても)。
+        // 同意を記録する前に作った PC との連携があれば、起動して最初に前面に出たときに 1 回だけ確かめる。
+        com.shakenokirimi12.uoa_app.ui.otprelay.OtpRelayConsentPrompt.showAtLaunch(this);
+        // 認証アプリ方式なのにキーが無い人への案内は、起動時ではなく、ログインでコードが要ったときに出す
+        // (AuthenticatorKeyChoice)。ログインの設定画面の案内は残る。
     }
 
-    /** API 33 以降は許可が無いと通知が一切出ない。これまでどこでも求めていなかった。 */
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        // コピーした認証アプリのキーの期限が、裏にいる間に過ぎていたら消す。クリップボードは前面で
+        // フォーカスがあるときにしか読めないので、onResume ではなくここで確かめる。
+        if (hasFocus) com.shakenokirimi12.uoa_app.ui.idp.AuthenticatorKeyActions.clearExpiredSecret(this);
+    }
+
     /**
      * 下タブを「タブの表示設定」どおりに組み直し、NavigationUI と結び直す。起動時と、設定画面で
      * タブを入れ替えたときに呼ぶ。トップバーの「戻る」を出さない画面 (= タブの根) も同時に更新する。
@@ -114,6 +187,56 @@ public class MainActivity extends AppCompatActivity {
         // ここで setupWithNavController を呼ぶとリスナーが多重登録される (タブ編集のたびに増える)。
         BottomNavigationView bottomNav = findViewById(R.id.bottom_navigation);
         com.shakenokirimi12.uoa_app.ui.util.MainTabs.applyTo(bottomNav, PreferenceManager.getInstance(this));
+    }
+
+    private boolean navigationLocked;
+    @androidx.annotation.Nullable private android.graphics.drawable.Drawable lockedNavigationIcon;
+
+    /**
+     * 上バーの「戻る」と下タブで画面を離れられないようにする / 戻す。OTP の登録の POST を送ったあと
+     * (IdPOtpRegistrationFragment) に使う。システムの戻る操作は画面側の OnBackPressedCallback が止める。
+     * 上バーの「戻る」と下タブは NavigationUI が直接 navigate するので、ここで塞ぐ。
+     */
+    public void setNavigationLocked(boolean locked) {
+        if (locked == navigationLocked) return;
+        navigationLocked = locked;
+        com.google.android.material.appbar.MaterialToolbar toolbar = findViewById(R.id.toolbar);
+        BottomNavigationView bottomNav = findViewById(R.id.bottom_navigation);
+        android.view.Menu menu = bottomNav.getMenu();
+        for (int i = 0; i < menu.size(); i++) menu.getItem(i).setEnabled(!locked);
+        if (locked) {
+            lockedNavigationIcon = toolbar.getNavigationIcon();
+            toolbar.setNavigationIcon(null);
+        } else {
+            // 塞いでいる間に遷移は起きないが、NavigationUI が付け直していたらそちらを優先する。
+            if (toolbar.getNavigationIcon() == null && lockedNavigationIcon != null) {
+                toolbar.setNavigationIcon(lockedNavigationIcon);
+            }
+            lockedNavigationIcon = null;
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        openTimetableFriend(intent);
+    }
+
+    /** 受け取った友達の時間割を開く。戻ると友達の一覧 (時間割共有) に戻る。手元に無い ID なら何もしない。 */
+    private void openTimetableFriend(@androidx.annotation.Nullable Intent intent) {
+        String id = intent != null ? intent.getStringExtra(EXTRA_OPEN_TIMETABLE_FRIEND) : null;
+        if (id == null || navigationLocked || isFinishing() || isDestroyed()) return;
+        intent.removeExtra(EXTRA_OPEN_TIMETABLE_FRIEND);
+        if (com.shakenokirimi12.uoa_app.data.timetable.TimetableShareStore.getInstance(this).friend(id) == null) return;
+        NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager()
+                .findFragmentById(R.id.nav_host_fragment);
+        if (navHostFragment == null) return;
+        NavController navController = navHostFragment.getNavController();
+        navController.navigate(R.id.navigation_timetable_friends);
+        Bundle args = new Bundle();
+        args.putString(com.shakenokirimi12.uoa_app.ui.timetable.FriendTimetableFragment.ARG_FRIEND_ID, id);
+        navController.navigate(R.id.navigation_timetable_friend, args);
     }
 
     /** ログイン中に OTP 未設定と分かったときに呼ばれる (OtpRegistrationLauncher)。既に開いていれば何もしない。 */
@@ -128,6 +251,58 @@ public class MainActivity extends AppCompatActivity {
         navController.navigate(R.id.navigation_idp_otp_registration);
     }
 
+    /** 設定画面と同じ判断 (ID / パスワードが無い・誤りなら理由をトーストで出す)。 */
+    @Override
+    public boolean canStartReregistration() {
+        return com.shakenokirimi12.uoa_app.ui.settings.LoginSettingsFragment.canStartReregistration(
+                this, com.shakenokirimi12.uoa_app.data.PreferenceManager.getInstance(this));
+    }
+
+    /**
+     * ログインで鍵が無いと分かり、選択で「認証アプリに登録し直す」を選んだ (AuthenticatorKeyChoice)。
+     * 設定画面の「認証アプリに登録し直す」と同じ登録し直しを開き、済んだらホームで取り直す (ARG_RESYNC_ON_SUCCESS)。
+     * 既に開いていれば何もしない。
+     */
+    @Override
+    public void openOtpReregistration() {
+        if (isFinishing() || isDestroyed()) return;
+        NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager()
+                .findFragmentById(R.id.nav_host_fragment);
+        if (navHostFragment == null) return;
+        NavController navController = navHostFragment.getNavController();
+        androidx.navigation.NavDestination current = navController.getCurrentDestination();
+        if (current != null && current.getId() == R.id.navigation_idp_otp_registration) return;
+        Bundle args = new Bundle();
+        args.putString(com.shakenokirimi12.uoa_app.ui.idp.IdPOtpRegistrationFragment.ARG_SWITCHING_TO,
+                com.shakenokirimi12.uoa_app.services.idp.OtpMethod.AUTHENTICATOR.value);
+        args.putBoolean(com.shakenokirimi12.uoa_app.ui.idp.IdPOtpRegistrationFragment.ARG_RESYNC_ON_SUCCESS, true);
+        navController.navigate(R.id.navigation_idp_otp_registration, args);
+    }
+
+    /**
+     * ログインの待ちが時間切れになったあとで、鍵を取り込めた (AuthenticatorKeyChoice)。ホームで取り直す。
+     * ホームが出ていればその場で、戻る先にあれば戻ったときに取り直す (KEY_FORCE_SYNC)。
+     */
+    @Override
+    public void syncAfterKeyImport() {
+        if (isFinishing() || isDestroyed()) return;
+        NavHostFragment navHostFragment = (NavHostFragment) getSupportFragmentManager()
+                .findFragmentById(R.id.nav_host_fragment);
+        if (navHostFragment == null) return;
+        androidx.fragment.app.Fragment shown = navHostFragment.getChildFragmentManager().getPrimaryNavigationFragment();
+        if (shown instanceof com.shakenokirimi12.uoa_app.ui.home.HomeFragment) {
+            ((com.shakenokirimi12.uoa_app.ui.home.HomeFragment) shown).syncNow();
+            return;
+        }
+        try {
+            navHostFragment.getNavController().getBackStackEntry(R.id.navigation_home).getSavedStateHandle()
+                    .set(com.shakenokirimi12.uoa_app.ui.home.HomeFragment.KEY_FORCE_SYNC, true);
+        } catch (IllegalArgumentException e) {
+            // ホームが戻る先に無い。開いたときの自動の取得に任せる。
+        }
+    }
+
+    /** API 33 以降は許可が無いと通知が一切出ない。これまでどこでも求めていなかった。 */
     private void requestNotificationPermissionIfNeeded() {
         if (android.os.Build.VERSION.SDK_INT < 33) return;
         if (androidx.core.content.ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS)
@@ -150,36 +325,19 @@ public class MainActivity extends AppCompatActivity {
         getOnBackPressedDispatcher().addCallback(this, swallowBack);
 
         AppConfigService.getInstance().config().observe(this, config -> {
-            applyBlockingState(config, overlay, swallowBack);
+            applyBlockingState(overlay, swallowBack);
             applyStatusNotice(config);
         });
     }
 
-    private void applyBlockingState(AppConfig config, View overlay, OnBackPressedCallback swallowBack) {
+    private void applyBlockingState(View overlay, OnBackPressedCallback swallowBack) {
         AppConfigService svc = AppConfigService.getInstance();
         TextView title = findViewById(R.id.blocking_title);
         TextView message = findViewById(R.id.blocking_message);
         Button button = findViewById(R.id.blocking_button);
 
-        // 強制更新を優先する。古いバージョンにメンテナンス解除後の画面を見せても意味がない。
-        if (svc.isForceUpdateRequired()) {
-            title.setText(R.string.force_update_title);
-            String msg = config.forceUpdateMessage;
-            message.setText(msg != null && !msg.isEmpty() ? msg : getString(R.string.force_update_default_message));
-            button.setText(R.string.force_update_open_store);
-            button.setEnabled(true);
-            button.setOnClickListener(v -> {
-                String url = config.forceUpdateURL;
-                if (url == null || url.isEmpty()) {
-                    url = "https://play.google.com/store/apps/details?id=" + getPackageName();
-                }
-                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-            });
-            overlay.setVisibility(View.VISIBLE);
-            swallowBack.setEnabled(true);
-            return;
-        }
-
+        // 強制更新は ForceUpdateActivity が全画面で出す (UoaApplication がどの画面の上にも出す)。
+        // ここではメンテナンスだけを扱う。
         if (svc.isFlagEnabled("maintenance_mode")) {
             title.setText(R.string.maintenance_title);
             String msg = svc.flagValue("maintenance_message");

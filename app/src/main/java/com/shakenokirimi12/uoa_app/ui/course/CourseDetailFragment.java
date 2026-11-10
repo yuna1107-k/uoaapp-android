@@ -1,5 +1,7 @@
 package com.shakenokirimi12.uoa_app.ui.course;
 
+import com.shakenokirimi12.uoa_app.services.AuthorizationContext;
+import android.content.Context;
 import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.util.TypedValue;
@@ -60,8 +62,8 @@ public class CourseDetailFragment extends Fragment {
     private CalendarEvent todayEvent;
 
     private TextView textPresentCount, textAbsentCount, textLateCount;
-    private TextView textAbsenceLabel, textDangerWarning, textTodayClassInfo;
-    private ProgressBar progressAbsence, progressContents;
+    private TextView textTodayClassInfo;
+    private ProgressBar progressContents;
     private MaterialCardView cardSyllabus, cardAttendance, cardTodayAction;
     private TextView textSyllabusCredits, textSyllabusCategory;
     private LinearLayout layoutContents;
@@ -105,9 +107,6 @@ public class CourseDetailFragment extends Fragment {
         textPresentCount = view.findViewById(R.id.text_present_count);
         textAbsentCount = view.findViewById(R.id.text_absent_count);
         textLateCount = view.findViewById(R.id.text_late_count);
-        textAbsenceLabel = view.findViewById(R.id.text_absence_label);
-        progressAbsence = view.findViewById(R.id.progress_absence);
-        textDangerWarning = view.findViewById(R.id.text_danger_warning);
         textTodayClassInfo = view.findViewById(R.id.text_today_class_info);
         progressContents = view.findViewById(R.id.progress_contents);
         layoutContents = view.findViewById(R.id.layout_contents);
@@ -141,17 +140,19 @@ public class CourseDetailFragment extends Fragment {
             InAppBrowserActivity.open(requireContext(), url);
         });
 
-        swipeRefresh.setOnRefreshListener(this::loadData);
+        // 引っ張って更新は利用者のやり直し。直前のログインの失敗による待ちを解く (開いたときの loadData では解かない)。
+        swipeRefresh.setOnRefreshListener(() -> loadData(true));
 
         cardSyllabus.setVisibility(View.GONE);
-        loadData();
+        loadData(false);
     }
 
-    private void loadData() {
+    /** @param userRetry 引っ張って更新。コースの中身の取得の前に、直前のログインの失敗による待ちを解く。 */
+    private void loadData(boolean userRetry) {
         loadAttendance();
         checkTodayClass();
         loadSyllabus();
-        loadCourseContents();
+        loadCourseContents(userRetry);
         loadAssignments();
         swipeRefresh.setRefreshing(false);
     }
@@ -182,11 +183,8 @@ public class CourseDetailFragment extends Fragment {
         textPresentCount.setText(String.valueOf(summary.present));
         textAbsentCount.setText(String.valueOf(summary.absent));
         textLateCount.setText(String.valueOf(summary.late));
-
-        int absence = summary.absent;
-        textAbsenceLabel.setText(String.format(Locale.JAPANESE, "欠席・遅刻許容数 (%d/5)", absence));
-        progressAbsence.setProgress(Math.min(absence, 5));
-        textDangerWarning.setVisibility(absence >= 5 ? View.VISIBLE : View.GONE);
+        // 以前は「欠席・遅刻許容数 (n/5)」と「落単の危険があります」を出していたが、5 には根拠が無い
+        // (科目ごとに違い、大学から取れる値でもない)。作った数字で警告しないよう、回数だけを出す。
 
         updateHistoryList(summary.history);
     }
@@ -199,9 +197,16 @@ public class CourseDetailFragment extends Fragment {
         }
         recyclerHistory.setVisibility(View.VISIBLE);
         textNoHistory.setVisibility(View.GONE);
-        recyclerHistory.setAdapter(new HistoryAdapter(history, historyId -> {
-            attendanceManager.removeHistory(String.valueOf(courseId), historyId);
-            loadAttendance();
+        recyclerHistory.setAdapter(new HistoryAdapter(history, new HistoryAdapter.Listener() {
+            @Override public void onDelete(String historyId) {
+                attendanceManager.removeHistory(String.valueOf(courseId), historyId);
+                loadAttendance();
+            }
+
+            @Override public void onChangeStatus(String historyId, AttendanceManager.Status status) {
+                attendanceManager.updateStatus(String.valueOf(courseId), historyId, status);
+                loadAttendance();
+            }
         }));
     }
 
@@ -225,10 +230,11 @@ public class CourseDetailFragment extends Fragment {
         }
 
         if (todayEvent != null) {
-            textTodayClassInfo.setText("授業あり: " + timeFmt.format(todayEvent.getDtstart()) + " ~");
+            textTodayClassInfo.setText(getString(R.string.course_detail_today_has_class_format,
+                    timeFmt.format(todayEvent.getDtstart())));
             textTodayClassInfo.setTextColor(MaterialColors.getColor(textTodayClassInfo, androidx.appcompat.R.attr.colorPrimary));
         } else {
-            textTodayClassInfo.setText("本日は授業予定がありません");
+            textTodayClassInfo.setText(R.string.course_detail_today_no_class);
             textTodayClassInfo.setTextColor(MaterialColors.getColor(textTodayClassInfo, com.google.android.material.R.attr.colorOnSurfaceVariant));
         }
 
@@ -238,7 +244,7 @@ public class CourseDetailFragment extends Fragment {
         btnAbsent.setEnabled(canRegister);
     }
 
-    private void loadCourseContents() {
+    private void loadCourseContents(boolean userRetry) {
         progressContents.setVisibility(View.VISIBLE);
         layoutContents.removeAllViews();
 
@@ -249,7 +255,7 @@ public class CourseDetailFragment extends Fragment {
                 if (!isAdded()) return;
                 progressContents.setVisibility(View.GONE);
                 if (sections.isEmpty()) {
-                    showContentsMessage("コンテンツはありません");
+                    showContentsMessage(getString(R.string.course_detail_contents_empty));
                 } else {
                     buildContentsUI(sections);
                 }
@@ -264,11 +270,12 @@ public class CourseDetailFragment extends Fragment {
         // 直近 10 分以内に他のタブが検証済みなら通信せずに通る。そうでなければ (コース一覧の
         // キャッシュから直接この画面に来た場合など) 必要に応じてログインする。
         PreferenceManager prefs = PreferenceManager.getInstance(requireContext());
-        service.ensureLoggedIn(prefs.getUsername(), prefs.getPassword(), true, new ServiceCallback<Boolean>() {
+        if (userRetry) service.allowLoginRetry();
+        service.ensureLoggedIn(prefs.getUsername(), prefs.getPassword(), AuthorizationContext.INTERACTIVE, new ServiceCallback<Boolean>() {
             @Override
             public void onSuccess(Boolean ok) {
                 if (!isAdded()) return;
-                service.fetchCourseContents(courseId, onContents);
+                service.fetchCourseContents(courseId, AuthorizationContext.INTERACTIVE, onContents);
             }
             @Override
             public void onError(String message) {
@@ -338,7 +345,7 @@ public class CourseDetailFragment extends Fragment {
 
             if (section.getModules().isEmpty()) {
                 TextView empty = new TextView(requireContext());
-                empty.setText("モジュールはありません");
+                empty.setText(R.string.course_detail_modules_empty);
                 empty.setTextAppearance(textAppearance(com.google.android.material.R.attr.textAppearanceBodySmall));
                 empty.setTextColor(onSurfaceVariant);
                 empty.setPadding(h, dp(4), h, dp(8));
@@ -416,7 +423,8 @@ public class CourseDetailFragment extends Fragment {
             Assignment a = items.get(pos);
             h.name.setText(a.getName());
             if (a.getDueDate() > 0) {
-                h.dueDate.setText("期限: " + fmt.format(new Date(a.getDueDate() * 1000)));
+                h.dueDate.setText(h.itemView.getContext().getString(R.string.course_detail_assignment_due_format,
+                        fmt.format(new Date(a.getDueDate() * 1000))));
             }
         }
 
@@ -434,11 +442,15 @@ public class CourseDetailFragment extends Fragment {
 
     static class HistoryAdapter extends RecyclerView.Adapter<HistoryAdapter.VH> {
         private final List<AttendanceManager.HistoryItem> items;
-        private final OnDeleteListener listener;
+        private final Listener listener;
 
-        interface OnDeleteListener { void onDelete(String id); }
+        interface Listener {
+            void onDelete(String id);
+            /** 記録の状態を手で変える (自動の欠席を出席に直す、など)。 */
+            void onChangeStatus(String id, AttendanceManager.Status status);
+        }
 
-        HistoryAdapter(List<AttendanceManager.HistoryItem> items, OnDeleteListener listener) {
+        HistoryAdapter(List<AttendanceManager.HistoryItem> items, Listener listener) {
             this.items = items;
             this.listener = listener;
         }
@@ -453,14 +465,17 @@ public class CourseDetailFragment extends Fragment {
         public void onBindViewHolder(@NonNull VH h, int pos) {
             AttendanceManager.HistoryItem item = items.get(pos);
             h.date.setText(item.date);
+            Context ctx = h.itemView.getContext();
             String label;
             switch (item.status) {
-                case "PRESENT": label = "出席"; break;
-                case "ABSENT": label = "欠席"; break;
-                case "LATE": label = "遅刻"; break;
+                case "PRESENT": label = ctx.getString(R.string.attendance_present); break;
+                case "ABSENT": label = ctx.getString(R.string.attendance_absent); break;
+                case "LATE": label = ctx.getString(R.string.attendance_late); break;
+                case "ABSENT_UNCONFIRMED": label = ctx.getString(R.string.attendance_unconfirmed); break;
                 default: label = item.status;
             }
-            if ("auto".equals(item.source)) label += " (自動)";
+            // 要確認はそれだけで自動と分かる。
+            if ("auto".equals(item.source) && !"ABSENT_UNCONFIRMED".equals(item.status)) label = ctx.getString(R.string.course_detail_history_auto_format, label);
             h.status.setText(label);
             int fg, bg;
             switch (item.status) {
@@ -473,6 +488,7 @@ public class CourseDetailFragment extends Fragment {
                     bg = MaterialColors.getColor(h.itemView, com.google.android.material.R.attr.colorErrorContainer);
                     break;
                 case "LATE":
+                case "ABSENT_UNCONFIRMED":
                     fg = h.itemView.getContext().getColor(R.color.warning);
                     bg = h.itemView.getContext().getColor(R.color.warning_container);
                     break;
@@ -483,6 +499,28 @@ public class CourseDetailFragment extends Fragment {
             h.status.setTextColor(fg);
             h.status.setChipBackgroundColor(ColorStateList.valueOf(bg));
             h.delete.setOnClickListener(v -> listener.onDelete(item.id));
+            // 自動の記録も手で直せる。直したものは手動の記録になる。
+            h.status.setClickable(true);
+            h.status.setFocusable(true);
+            h.status.setContentDescription(ctx.getString(R.string.course_detail_history_change_description, label));
+            View.OnClickListener openMenu = v -> {
+                android.widget.PopupMenu menu = new android.widget.PopupMenu(v.getContext(), h.status);
+                AttendanceManager.Status[] options = {
+                        AttendanceManager.Status.PRESENT, AttendanceManager.Status.LATE, AttendanceManager.Status.ABSENT};
+                String[] labels = {ctx.getString(R.string.attendance_present),
+                        ctx.getString(R.string.attendance_late), ctx.getString(R.string.attendance_absent)};
+                for (int i = 0; i < options.length; i++) menu.getMenu().add(0, i, i, labels[i]);
+                menu.setOnMenuItemClickListener(mi -> {
+                    listener.onChangeStatus(item.id, options[mi.getItemId()]);
+                    return true;
+                });
+                menu.show();
+            };
+            h.status.setOnClickListener(openMenu);
+            h.status.setCloseIconResource(R.drawable.ic_chevron_down);
+            h.status.setCloseIconTint(ColorStateList.valueOf(fg));
+            h.status.setCloseIconVisible(true);
+            h.status.setOnCloseIconClickListener(openMenu);
         }
 
         @Override public int getItemCount() { return items.size(); }

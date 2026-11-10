@@ -4,6 +4,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
+import com.shakenokirimi12.uoa_app.R;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.CalendarEvent;
 import com.shakenokirimi12.uoa_app.data.models.FacilityUsage;
@@ -62,7 +63,8 @@ public class CampusSquareService {
     public void login(String username, String password, ServiceCallback<Boolean> callback) {
         executor.execute(() -> {
             try {
-                coordinator.forceLogin(SESSION_KIND, () -> freshLogin(username, password));
+                coordinator.forceLogin(sessionKey(username), () -> freshLogin(username, password, AuthorizationContext.INTERACTIVE),
+                        unattended(username, password));
                 postSuccess(callback, true);
             } catch (Exception e) {
                 postError(callback, e.getMessage());
@@ -72,12 +74,13 @@ public class CampusSquareService {
 
     /**
      * 必要ならログインして、認証済みであることを確認する。既に 10 分以内に検証済みなら通信しない。
-     * userInitiated=false (SyncWorker) は直前の障害系失敗から 60 秒間は再ログインを試みない。
+     * BACKGROUND (SyncWorker) は、BackgroundLoginPolicy が許すとき (認証アプリ方式でこのアプリが鍵を持つ等)
+     * だけ新規ログインする。許さなければ、保存済みセッションが死んでいたら諦める。
      */
-    public void ensureLoggedIn(String username, String password, boolean userInitiated, ServiceCallback<Boolean> callback) {
+    public void ensureLoggedIn(String username, String password, AuthorizationContext context, ServiceCallback<Boolean> callback) {
         executor.execute(() -> {
             try {
-                authenticatedCookieHeader(username, password, userInitiated);
+                authenticatedCookieHeader(username, password, context);
                 postSuccess(callback, true);
             } catch (Exception e) {
                 postError(callback, e.getMessage());
@@ -101,7 +104,7 @@ public class CampusSquareService {
 
     /** 取得の途中で未認証ページを掴んだことを withSession に伝える。 */
     static final class SessionExpiredException extends Exception {
-        SessionExpiredException() { super("CampusSquare のセッションが切れました"); }
+        SessionExpiredException() { super(AppStrings.get(R.string.campussquare_session_expired)); }
     }
 
     private interface SessionBody<T> { T run(String cookieHeader) throws Exception; }
@@ -110,30 +113,65 @@ public class CampusSquareService {
      * SeciossIdPClient が集めた複数 cookie (AWS ALB のスティッキーセッション cookie や Shibboleth の
      * _shibsession_ を含む) を、そのまま Cookie ヘッダに載せられる文字列で返す。
      */
-    private String authenticatedCookieHeader(String username, String password, boolean userInitiated) throws Exception {
-        String cached = PreferenceManager.getInstance().getCsIdpSessionCookieHeader();
+    private String authenticatedCookieHeader(String username, String password, AuthorizationContext context) throws Exception {
+        if (AccountSwitch.isStale(username)) throw new AccountChangedException();
+        String cached = storedSessionHeader(username);
         String candidate = cached.isEmpty() ? null : cached;
-        return coordinator.session(SESSION_KIND, userInitiated, candidate, this::probeSession,
-                () -> freshLogin(username, password));
+        return coordinator.session(sessionKey(username), context, candidate, this::probeSession,
+                () -> freshLogin(username, password, context), unattended(username, password));
     }
 
-    private String freshLogin(String username, String password) throws Exception {
+    /**
+     * SessionCoordinator に渡す鍵。方式と持ち主 (ユーザー名) の組。アカウントを切り替えている間に前のアカウントの
+     * 取得がセッションを作り直しても、新しいアカウントはそれを使わず、飛行中のログインにも合流しない。
+     */
+    private static Object sessionKey(String username) {
+        return java.util.Arrays.asList(SESSION_KIND, username.trim());
+    }
+
+    /** バックグラウンドの再ログインの判定。ログインに使うのと同じ ID / パスワードで作る。 */
+    private static SessionCoordinator.Unattended unattended(String username, String password) {
+        return BackgroundLoginPolicy.getInstance().forAccount("campussquare", username, password);
+    }
+
+    /**
+     * 永続化した owner の CampusSquare のセッションを、CampusSquare へ送る Cookie ヘッダにする。失効分と、Path や
+     * Secure の合わないものはここで落ちる。持ち主の無いもの (旧形式を含む) は消す。別のアカウントのものは使わないが
+     * 残す (消すと、そのアカウントに戻ったときにログインし直しになる)。
+     */
+    private static String storedSessionHeader(String owner) {
+        PreferenceManager prefs = PreferenceManager.getInstance();
+        String stored = prefs.getCsIdpSessionCookies();
+        if (stored == null || stored.isEmpty()) return "";
+        if (SpSessionCookies.ownerOf(stored) == null) {
+            prefs.setCsIdpSessionCookies(null);
+            return "";
+        }
+        if (!SpSessionCookies.ownedBy(stored, owner)) return "";
+        okhttp3.HttpUrl base = okhttp3.HttpUrl.parse(baseUrl());
+        if (base == null) return "";
+        long now = System.currentTimeMillis();
+        List<okhttp3.Cookie> cookies = SpSessionCookies.restore(stored, owner, base.host(), now);
+        return SpSessionCookies.headerFor(cookies, base, now);
+    }
+
+    private String freshLogin(String username, String password, AuthorizationContext context) throws Exception {
         // ここに来るのは永続化した cookie も死んでいたとき。捨ててから取り直す。
-        PreferenceManager.getInstance().setCsIdpSessionCookieHeader(null);
-        return loginViaIdPAutomatic(null, username, password);
+        PreferenceManager.getInstance().setCsIdpSessionCookies(null);
+        return loginViaIdPAutomatic(null, username, password, context);
     }
 
     /**
      * 取得処理を認証済みセッションで実行し、途中で未認証ページを掴んだ (SessionExpiredException) 場合だけ
      * 1 回、ログインし直して再実行する。
      */
-    private <T> T withSession(String username, String password, boolean userInitiated, SessionBody<T> body) throws Exception {
-        String cookie = authenticatedCookieHeader(username, password, userInitiated);
+    private <T> T withSession(String username, String password, AuthorizationContext context, SessionBody<T> body) throws Exception {
+        String cookie = authenticatedCookieHeader(username, password, context);
         try {
             return body.run(cookie);
         } catch (SessionExpiredException e) {
             coordinator.invalidate(cookie);
-            String fresh = authenticatedCookieHeader(username, password, userInitiated);
+            String fresh = authenticatedCookieHeader(username, password, context);
             return body.run(fresh);
         }
     }
@@ -165,23 +203,53 @@ public class CampusSquareService {
     private String probeSession(String cookieHeader) {
         String url = AppConfigService.getInstance().stringFlag("campussquare_session_check_url",
                 baseUrl() + "/campusportal.do?page=main");
+        okhttp3.HttpUrl cs = okhttp3.HttpUrl.parse(baseUrl());
+        return probeSession(NetworkClient.getNoRedirectClient(), url, cookieHeader,
+                cs != null ? cs.host() : "csweb.u-aizu.ac.jp");
+    }
+
+    /**
+     * 生きていれば cookieHeader、死んでいれば null。
+     *
+     * リダイレクトは csweb の中だけ追う。未ログインの csweb は IdP (slink.secioss.com) へ 302 を返す。追うと
+     * 手で付けた Cookie ヘッダ (CampusSquare のセッション) がそのまま IdP へ送られ、IdP 側で古い状態と
+     * 組み合わさってループしうるので、別ホストへの 3xx が返った時点で未ログインとする。
+     * 同じホスト内の 3xx は追う。ログイン済みでも CampusSquare のフロー URL は _flowExecutionKey 付きの
+     * URL へ 302 する (成績・施設の取得がこれを前提にしている) ので、確認 URL をフラグでフロー URL に
+     * 差し替えたときに、生きているセッションを毎回「未ログイン」と判定して OTP のメールを送らせないように。
+     */
+    static String probeSession(OkHttpClient noRedirectClient, String url, String cookieHeader, String expectedHost) {
         Request req = new Request.Builder()
                 .url(url)
                 .header("User-Agent", NetworkClient.getUserAgent())
                 .header("Cookie", cookieHeader)
                 .build();
-        try (Response resp = NetworkClient.getNoCookieClient().newCall(req).execute()) {
+        try (Response resp = NetworkClient.executeFollowingSameHostRedirects(noRedirectClient, req)) {
+            if (resp.isRedirect() || resp.code() / 100 == 3) return null;
             String html = resp.body() != null ? resp.body().string() : "";
-            boolean alive = resp.isSuccessful() && !looksUnauthenticated(html, resp.request().url().toString());
+            boolean alive = resp.isSuccessful()
+                    && !looksUnauthenticated(html, resp.request().url().toString(), expectedHost);
             return alive ? cookieHeader : null;
         } catch (IOException e) {
             return null;
         }
     }
 
+    /**
+     * 利用者がやり直したとき (引っ張って更新・再試行ボタン) に、その取得を同じインスタンスで呼ぶ直前に呼ぶ。
+     * 直前のログインの失敗による待ち (SessionCoordinator.LOGIN_BACKOFF_MS) を解き、その取得で新しくログインさせる。
+     * 画面を開いただけの取得では呼ばない (失敗の直後に OTP を自動で求め直さないため)。iOS の allowLoginRetry と同じ。
+     *
+     * 解くのは executor の上で、利用者の取得の直前の順番にする。すぐに解くと、同じ executor で先に走っている
+     * 自動の取得が後から失敗して待ちを付け直し、利用者の取得がその失敗を受け取る (自動の同期の最中に引っ張ったとき)。
+     */
+    public void allowLoginRetry() {
+        executor.execute(coordinator::clearBackoff);
+    }
+
     /** ログアウト時に呼ぶ。永続化した IdP cookie とメモリ上のセッション状態を両方捨てる。 */
     public static void clearSession() {
-        PreferenceManager.getInstance().setCsIdpSessionCookieHeader(null);
+        PreferenceManager.getInstance().setCsIdpSessionCookies(null);
         SeciossSsoStore.getInstance().clear();
         coordinator.reset();
     }
@@ -204,24 +272,24 @@ public class CampusSquareService {
 
     /**
      * IdP (SECIOSS) 経由でログインし、CampusSquare のセッション Cookie ヘッダを返す (キャッシュにも保存)。
-     * entryUrl が null なら resolveCampusSquareEntryUrl() の結果を使う。otpCode は OTP が要求された
-     * 場合にのみ呼ばれる (UI 入力待ちや IMAP 自動取得)。
-     * ID/PW 誤りは AuthErrors.INVALID_CREDENTIALS_MESSAGE の Exception に変換して投げる。既存の
+     * entryUrl が null なら resolveCampusSquareEntryUrl() の結果を使う。otp は OTP が要求された
+     * 場合にのみ呼ばれる (方式ごとの実体は OtpProviders が決める)。
+     * ID/PW 誤りは AuthErrors.invalidCredentialsMessage() の Exception に変換して投げる。既存の
      * onError 側 (markInvalidIfCredentialsError) がそのまま自動同期を止められるようにするため。
      */
     public String loginViaIdP(String entryUrl, String username, String password,
-                              SeciossIdPClient.OtpCodeProvider otpCode) throws Exception {
+                              com.shakenokirimi12.uoa_app.services.idp.OtpProvider otp) throws Exception {
         String uid = username.trim();
         String pass = password.trim();
         String resolvedEntry = entryUrl != null ? entryUrl : resolveCampusSquareEntryUrl();
         SeciossIdPClient.Session session;
         try {
-            session = seciossClient.login(resolvedEntry, uid, pass, otpCode);
+            session = seciossClient.login(resolvedEntry, uid, pass, otp);
         } catch (SeciossError e) {
             // OTP 未設定はここでしか分からない。設定画面を探させず、その場で登録画面を開く。
             com.shakenokirimi12.uoa_app.services.idp.OtpRegistrationLauncher.launchIfNeeded(e);
             if (e.kind == SeciossError.Kind.INVALID_CREDENTIALS) {
-                throw new Exception(AuthErrors.INVALID_CREDENTIALS_MESSAGE);
+                throw new Exception(AuthErrors.invalidCredentialsMessage());
             }
             throw new Exception(e.loginMessage(), e);
         }
@@ -232,35 +300,46 @@ public class CampusSquareService {
         String finalHost = finalUrl != null ? finalUrl.host().toLowerCase() : "";
         String csHost = csUrl != null ? csUrl.host().toLowerCase() : "csweb.u-aizu.ac.jp";
         if (!finalHost.equals(csHost)) {
-            throw new Exception(new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
-                    "CampusSquareへ戻れていない(final=" + session.finalUrl + ")").loginMessage());
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                    AppStrings.get(R.string.campussquare_error_not_returned, session.finalUrl)).asLoginException();
         }
         // メンテナンスページにも「ログアウト」が含まれるため、成功マーカーより先に見る (Moodle で 2026-09-15 実測)。
         if (SeciossIdPClient.isMaintenancePage(session.finalStatus, session.finalHtml)) {
-            throw new Exception(new SeciossError(SeciossError.Kind.MAINTENANCE,
-                    SeciossIdPClient.visibleExcerpt(session.finalHtml, 200)).loginMessage());
+            throw new SeciossError(SeciossError.Kind.MAINTENANCE,
+                    SeciossIdPClient.visibleExcerpt(session.finalHtml, 200)).asLoginException();
         }
         // 2026-09-14 実測: SP まで戻れても CampusSquare 本体が
         // "[SSO-Error] あなたは現在このシステムを利用することができません" を返す段階がある
         // (SP 側のユーザー紐付けが未開放)。一般エラーではなく明示する。
         if (session.finalHtml.contains("[SSO-Error]") || session.finalHtml.contains("このシステムを利用することができません")) {
-            throw new Exception(new SeciossError(SeciossError.Kind.ACCESS_DENIED, "campussquare_sso_error").loginMessage());
+            throw new SeciossError(SeciossError.Kind.ACCESS_DENIED, "campussquare_sso_error").asLoginException();
         }
         if (!containsAnySuccessMarker(session.finalHtml)) {
-            throw new Exception(new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
-                    "CampusSquareへの復帰後、成功マーカーが見つからない").loginMessage());
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                    AppStrings.get(R.string.campussquare_error_no_success_marker)).asLoginException();
         }
-        PreferenceManager.getInstance().setCsIdpSessionCookieHeader(session.cookieHeader);
+        // 属性込みで保存する (次回起動で storedSessionHeader が読む)。返すのは今回のチェーンの最終ホップに
+        // 送られたのと同じヘッダ。
+        PreferenceManager.getInstance().setCsIdpSessionCookies(
+                SpSessionCookies.serialize(session.spCookies, System.currentTimeMillis(), uid));
         return session.cookieHeader;
     }
 
     /**
-     * OTP の取得は OtpPromptCoordinator に任せる (同意済みならメールから自動取得、無理ならアプリが
-     * 前面にいるときだけ入力ダイアログ、それも無理なら INTERACTIVE_LOGIN_REQUIRED)。
+     * OTP の方式 (メール / 認証アプリ) は OtpProviders が IdP の OTP 画面 (otp_type) から決める。
+     * ここに来るのは SessionCoordinator が新規ログインを許した場合だけ。BACKGROUND なら、BackgroundLoginPolicy が
+     * 方式ごとの条件 (認証アプリは止めていない鍵、メールは 6 時間の枠) を確かめてある。
      */
-    public String loginViaIdPAutomatic(String entryUrl, String username, String password) throws Exception {
-        return loginViaIdP(entryUrl, username, password,
-                () -> OtpPromptCoordinator.getInstance().code(username.trim(), password.trim()));
+    public String loginViaIdPAutomatic(String entryUrl, String username, String password,
+                                       AuthorizationContext context) throws Exception {
+        com.shakenokirimi12.uoa_app.services.idp.OtpProvider otp =
+                com.shakenokirimi12.uoa_app.services.idp.OtpProviders.forLogin(username.trim(), password.trim(), context);
+        // バックグラウンドでは、判定 (BackgroundLoginPolicy) のあとで条件が崩れていたら IdP に触れずに止める
+        // (鍵を止めた・控えが消えた等)。メールの送信の枠は送る直前にもう一度取る (OtpProvider.beforeMailDispatch)。
+        if (!context.allowsNewLogin() && !otp.canRunUnattended()) {
+            throw new SeciossError(SeciossError.Kind.INTERACTIVE_LOGIN_REQUIRED);
+        }
+        return loginViaIdP(entryUrl, username, password, otp);
     }
 
     /**
@@ -347,25 +426,23 @@ public class CampusSquareService {
         return resolved != null ? resolved.toString() : relative;
     }
 
-    public void fetchGrades(String username, String password, ServiceCallback<List<Grade>> callback) {
-        fetchGrades(username, password, true, callback);
-    }
-
-    public void fetchGrades(String username, String password, boolean userInitiated, ServiceCallback<List<Grade>> callback) {
+    public void fetchGrades(String username, String password, AuthorizationContext context, ServiceCallback<List<Grade>> callback) {
         if (!AppConfigService.getInstance().isFeatureEnabled("campussquare_grades_enabled")) {
             callback.onError(AppConfigService.FEATURE_DISABLED_MESSAGE);
             return;
         }
+        // 積んだ時点で控える。待っている間に切り替えが始まった取得の結果も捨てられるように。
+        AccountSwitch.Ticket ticket = AccountSwitch.ticket();
         executor.execute(() -> {
             try {
-                List<Grade> grades = withSession(username, password, userInitiated, this::fetchGradesWithSession);
+                List<Grade> grades = withSession(username, password, context, this::fetchGradesWithSession);
                 if (grades == null) {
-                    postError(callback, "成績ページのフローキー取得に失敗しました");
+                    postErrorForAccount(callback, AppStrings.get(R.string.campussquare_flow_key_failed), ticket);
                     return;
                 }
-                postSuccess(callback, grades);
+                postSuccessForAccount(callback, grades, ticket);
             } catch (Exception e) {
-                postError(callback, e.getMessage());
+                postErrorForAccount(callback, e.getMessage(), ticket);
             }
         });
     }
@@ -444,27 +521,23 @@ public class CampusSquareService {
         return parseGrades(gradesHtml);
     }
 
-    public void fetchCalendarEvents(String username, String password,
-                                    ServiceCallback<List<CalendarEvent>> callback) {
-        fetchCalendarEvents(username, password, true, callback);
-    }
-
-    public void fetchCalendarEvents(String username, String password, boolean userInitiated,
+    public void fetchCalendarEvents(String username, String password, AuthorizationContext context,
                                     ServiceCallback<List<CalendarEvent>> callback) {
         if (!AppConfigService.getInstance().isFeatureEnabled("campussquare_calendar_enabled")) {
             callback.onError(AppConfigService.FEATURE_DISABLED_MESSAGE);
             return;
         }
+        AccountSwitch.Ticket ticket = AccountSwitch.ticket();
         executor.execute(() -> {
             try {
-                List<CalendarEvent> events = withSession(username, password, userInitiated, this::fetchCalendarEventsWithSession);
+                List<CalendarEvent> events = withSession(username, password, context, this::fetchCalendarEventsWithSession);
                 if (events == null) {
-                    postError(callback, "カレンダーURLの取得に失敗しました");
+                    postErrorForAccount(callback, AppStrings.get(R.string.campussquare_calendar_url_failed), ticket);
                     return;
                 }
-                postSuccess(callback, events);
+                postSuccessForAccount(callback, events, ticket);
             } catch (Exception e) {
-                postError(callback, e.getMessage());
+                postErrorForAccount(callback, e.getMessage(), ticket);
             }
         });
     }
@@ -574,7 +647,12 @@ public class CampusSquareService {
             Date dtEnd = parseIcsDate(dtEndRaw);
 
             if (dtStart != null && dtEnd != null) {
-                events.add(new CalendarEvent(summary, location, dtStart, dtEnd));
+                CalendarEvent event = new CalendarEvent(summary, location, dtStart, dtEnd);
+                String description = extractIcsField(block, "DESCRIPTION");
+                if (description != null) event.setDescription(description.replace("\\n", "\n").replace("\\,", ","));
+                String status = extractIcsField(block, "STATUS");
+                if (status != null && !status.isEmpty()) event.setStatus(status);
+                events.add(event);
             }
         }
         return events;
@@ -644,7 +722,8 @@ public class CampusSquareService {
                 try {
                     String username = prefs.getUsername().trim();
                     String password = prefs.getPassword().trim();
-                    List<FacilityUsage> facilities = withSession(username, password, true,
+                    List<FacilityUsage> facilities = withSession(username, password,
+                            AuthorizationContext.INTERACTIVE,
                             cookie -> fetchFacilityUsageWithSession(cookie, dateStr));
                     postSuccess(callback, facilities);
                     return;
@@ -681,7 +760,7 @@ public class CampusSquareService {
                 flowKey = extractMatch(html, "_flowExecutionKey=([a-zA-Z0-9_-]+)");
             }
             if (flowKey == null) {
-                throw new IOException("内部版の施設利用状況ページからフローキーを取得できませんでした");
+                throw new IOException(AppStrings.get(R.string.campussquare_facility_flow_key_failed));
             }
             Request dateReq = new Request.Builder()
                     .url(baseUrl() + "/campussquare.do?_flowExecutionKey=" + flowKey
@@ -699,7 +778,7 @@ public class CampusSquareService {
 
         List<FacilityUsage> facilities = parseFacilityUsage(html);
         if (facilities.isEmpty()) {
-            throw new IOException("内部版の施設利用状況を解析できませんでした");
+            throw new IOException(AppStrings.get(R.string.campussquare_facility_parse_failed));
         }
         return facilities;
     }
@@ -859,7 +938,37 @@ public class CampusSquareService {
         mainHandler.post(() -> cb.onSuccess(result));
     }
 
+    /**
+     * アカウントのデータ (成績・カレンダー) を渡す。取得を始めてからアカウントの切り替えが始まっていたら、前の
+     * アカウントのデータなので渡さずに捨て、失敗として返す (画面やキャッシュに残さない)。切り替えは
+     * メインスレッドで行うので、ここもメインスレッドで比べる。
+     */
+    private <T> void postSuccessForAccount(ServiceCallback<T> cb, T result, AccountSwitch.Ticket ticket) {
+        mainHandler.post(() -> {
+            if (ticket.isCurrent()) {
+                cb.onSuccess(result);
+            } else {
+                Log.w(TAG, "Dropping CampusSquare data fetched for the previous account");
+                cb.onError(new AccountChangedException().getMessage());
+            }
+        });
+    }
+
+    /**
+     * postSuccessForAccount の失敗版。前のアカウントの失敗 (ID / パスワードの誤りなど) をそのまま渡すと、画面が
+     * 今のアカウントの資格情報に誤りの印を付けて (markInvalidIfCredentialsError) ログインを止めるので、差し替える。
+     */
+    private <T> void postErrorForAccount(ServiceCallback<T> cb, String msg, AccountSwitch.Ticket ticket) {
+        mainHandler.post(() -> {
+            if (ticket.isCurrent()) {
+                cb.onError(msg != null ? msg : AppStrings.get(R.string.common_unknown_problem));
+            } else {
+                cb.onError(new AccountChangedException().getMessage());
+            }
+        });
+    }
+
     private <T> void postError(ServiceCallback<T> cb, String msg) {
-        mainHandler.post(() -> cb.onError(msg != null ? msg : "不明なエラー"));
+        mainHandler.post(() -> cb.onError(msg != null ? msg : AppStrings.get(R.string.common_unknown_problem)));
     }
 }

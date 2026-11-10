@@ -5,7 +5,7 @@ import android.os.Looper;
 import android.util.Log;
 
 import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
+import com.shakenokirimi12.uoa_app.R;
 import com.shakenokirimi12.uoa_app.data.models.Assignment;
 import com.shakenokirimi12.uoa_app.data.models.MoodleCourse;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
@@ -15,7 +15,6 @@ import com.shakenokirimi12.uoa_app.services.idp.SeciossError;
 import com.shakenokirimi12.uoa_app.services.idp.SeciossIdPClient;
 
 import java.io.IOException;
-import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -44,7 +43,7 @@ public class MoodleService {
 
     /** 画面側が「この URL は Moodle か」を判定するために使う。 */
     public static String currentBaseUrl() { return baseUrl(); }
-    public static final String INVALID_CREDENTIALS_MESSAGE = AuthErrors.INVALID_CREDENTIALS_MESSAGE;
+    public static String invalidCredentialsMessage() { return AuthErrors.invalidCredentialsMessage(); }
 
     public static boolean isInvalidCredentialsError(String message) {
         return AuthErrors.isInvalidCredentials(message);
@@ -66,6 +65,12 @@ public class MoodleService {
     // detail) called the AJAX API with an empty sesskey and quietly got nothing back.
     private static volatile String sesskey = "";
     private static volatile String userid = "";
+    /**
+     * 共有 cookie jar にある Moodle のセッションの持ち主 (ユーザー名)。null は不明。ログインの開始と保存分の復元で
+     * 決まる。アカウント A の生存確認が走っている間に B のログインが終わると、A の確認は jar にある B の cookie を
+     * 読む。それを A のものとして保存しないために、保存の前に突き合わせる。
+     */
+    private static volatile String jarOwner = null;
 
     /**
      * ログインの要否をプロセスで 1 つ判断する (iOS の ensureSession / lastSessionVerifiedAt と同じ)。
@@ -79,12 +84,25 @@ public class MoodleService {
         return sesskey != null && !sesskey.isEmpty();
     }
 
+    /**
+     * 利用者がやり直したとき (引っ張って更新・再試行ボタン) に、その取得を同じインスタンスで呼ぶ直前に呼ぶ。
+     * 直前のログインの失敗による待ち (SessionCoordinator.LOGIN_BACKOFF_MS) を解き、その取得で新しくログインさせる。
+     * 画面を開いただけの取得では呼ばない (失敗の直後に OTP を自動で求め直さないため)。iOS の allowLoginRetry と同じ。
+     *
+     * 解くのは executor の上で、利用者の取得の直前の順番にする。すぐに解くと、同じ executor で先に走っている
+     * 自動の取得が後から失敗して待ちを付け直し、利用者の取得がその失敗を受け取る (自動の同期の最中に引っ張ったとき)。
+     */
+    public void allowLoginRetry() {
+        executor.execute(coordinator::clearBackoff);
+    }
+
     /** ログアウト時に呼ぶ。cookie jar は NetworkClient.clearCookies() が別に消す。 */
     public static void clearSession() {
         sesskey = "";
         userid = "";
+        jarOwner = null;
         coordinator.reset();
-        PreferenceManager.getInstance().setMoodleSessionCookieHeader(null);
+        PreferenceManager.getInstance().setMoodleSessionCookies(null);
     }
 
     /**
@@ -97,7 +115,7 @@ public class MoodleService {
 
     /** 取得の途中で未認証と分かったことを withSession に伝える。 */
     private static final class SessionExpiredException extends Exception {
-        SessionExpiredException() { super("Moodle のセッションが切れました"); }
+        SessionExpiredException() { super(AppStrings.get(R.string.moodle_session_expired)); }
     }
 
     private interface SessionBody<T> { T run(String sesskey) throws Exception; }
@@ -143,23 +161,36 @@ public class MoodleService {
     }
 
     /**
-     * OTP の取得は CampusSquare と同じく OtpPromptCoordinator に任せる (同意済みならメールから自動取得、
+     * OTP の取得は CampusSquare と同じく OtpPromptCoordinator に任せる (メール方式ならメールから自動取得、
      * アプリが前面にいれば入力ダイアログ、バックグラウンド同期なら INTERACTIVE_LOGIN_REQUIRED)。
      * 成功した cookie だけを共有 cookie jar へ注入する。順序が逆だと、ログイン失敗時にも IdP 側の cookie が
      * 残り、以降のリクエストに無関係なセッションが乗る。
+     *
+     * @param verifyPassword 資格情報の確認 (login)。保存している SSO を使わず、必ずパスワードを送る。
      */
-    private void loginViaIdP(String username, String password) throws Exception {
+    private void loginViaIdP(String username, String password, AuthorizationContext context, boolean verifyPassword) throws Exception {
         String uid = username.trim();
         String pass = password.trim();
+        // ここに来るのは SessionCoordinator が新規ログインを許した場合だけ。BACKGROUND なら、BackgroundLoginPolicy が
+        // 方式ごとの条件 (認証アプリは止めていない鍵、メールは 6 時間の枠) を確かめてある。
+        com.shakenokirimi12.uoa_app.services.idp.OtpProvider otp =
+                com.shakenokirimi12.uoa_app.services.idp.OtpProviders.forLogin(uid, pass, context);
+        // バックグラウンドでは、判定 (BackgroundLoginPolicy) のあとで条件が崩れていたら IdP に触れずに止める
+        // (鍵を止めた・控えが消えた等)。メールの送信の枠は送る直前にもう一度取る (OtpProvider.beforeMailDispatch)。
+        // 下の catch で文言に包むと SyncWorker が「ログインが必要」と見分けられないので、try の外で投げる。
+        if (!context.allowsNewLogin() && !otp.canRunUnattended()) {
+            throw new SeciossError(SeciossError.Kind.INTERACTIVE_LOGIN_REQUIRED);
+        }
         SeciossIdPClient.Session session;
         try {
-            session = seciossClient.login(samlEntryUrl(), uid, pass,
-                    () -> OtpPromptCoordinator.getInstance().code(uid, pass));
+            session = verifyPassword
+                    ? seciossClient.loginVerifyingPassword(samlEntryUrl(), uid, pass, otp)
+                    : seciossClient.login(samlEntryUrl(), uid, pass, otp);
         } catch (SeciossError e) {
             // OTP 未設定はここでしか分からない。設定画面を探させず、その場で登録画面を開く。
             com.shakenokirimi12.uoa_app.services.idp.OtpRegistrationLauncher.launchIfNeeded(e);
             if (e.kind == SeciossError.Kind.INVALID_CREDENTIALS) {
-                throw new Exception(INVALID_CREDENTIALS_MESSAGE);
+                throw new Exception(invalidCredentialsMessage());
             }
             throw new Exception(e.loginMessage(), e);
         }
@@ -167,28 +198,26 @@ public class MoodleService {
         // (2) IdP 側のページで止まっても復帰先ホストで弾く、(3) login/index.php へ戻された = SP 側で
         // このユーザーが未開放。
         if (SeciossIdPClient.isMaintenancePage(session.finalStatus, session.finalHtml)) {
-            throw new Exception(new SeciossError(SeciossError.Kind.MAINTENANCE,
-                    SeciossIdPClient.visibleExcerpt(session.finalHtml, 200)).loginMessage());
+            throw new SeciossError(SeciossError.Kind.MAINTENANCE,
+                    SeciossIdPClient.visibleExcerpt(session.finalHtml, 200)).asLoginException();
         }
         okhttp3.HttpUrl base = okhttp3.HttpUrl.parse(baseUrl());
         String host = base != null ? base.host() : "elms.u-aizu.ac.jp";
         okhttp3.HttpUrl finalUrl = okhttp3.HttpUrl.parse(session.finalUrl);
         String finalHost = finalUrl != null ? finalUrl.host().toLowerCase() : "";
         if (!finalHost.equals(host.toLowerCase())) {
-            throw new Exception(new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
-                    "Moodle へ戻れていない(final=" + session.finalUrl + ")").loginMessage());
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                    AppStrings.get(R.string.moodle_error_not_returned, session.finalUrl)).asLoginException();
         }
         if (session.finalUrl.contains("login/index.php")) {
-            throw new Exception(new SeciossError(SeciossError.Kind.ACCESS_DENIED, "moodle_login_page").loginMessage());
+            throw new SeciossError(SeciossError.Kind.ACCESS_DENIED, "moodle_login_page").asLoginException();
         }
         if (!containsAnySuccessMarker(session.finalHtml)) {
-            throw new Exception(new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
-                    "Moodle への復帰後、成功マーカーが見つからない(url=" + session.finalUrl + ") "
-                            + SeciossIdPClient.visibleExcerpt(session.finalHtml, 200)).loginMessage());
+            throw new SeciossError(SeciossError.Kind.UNRECOGNIZED_STATE,
+                    AppStrings.get(R.string.moodle_error_no_success_marker, session.finalUrl) + " "
+                            + SeciossIdPClient.visibleExcerpt(session.finalHtml, 200)).asLoginException();
         }
-        boolean secure = base == null || base.isHttps();
-        int dropped = NetworkClient.injectCookieHeader(host, secure, session.cookieHeader);
-        if (dropped > 0) Log.w(TAG, "IdP session: " + dropped + " cookie(s) could not be imported");
+        NetworkClient.addCookies(session.spCookies);
     }
 
     /**
@@ -202,7 +231,8 @@ public class MoodleService {
         }
         executor.execute(() -> {
             try {
-                coordinator.forceLogin(resolveLoginMethod(), () -> doLogin(username, password));
+                coordinator.forceLogin(sessionKey(username), () -> doLogin(username, password, AuthorizationContext.INTERACTIVE, true),
+                        unattended(username, password));
                 postSuccess(callback, true);
             } catch (Exception e) {
                 postLoginError(callback, e);
@@ -212,16 +242,17 @@ public class MoodleService {
 
     /**
      * 必要ならログインして、認証済みであることを確認する。10 分以内に検証済みなら通信しない。
-     * userInitiated=false (SyncWorker) は直前の障害系失敗から 60 秒間は再ログインを試みない。
+     * BACKGROUND (SyncWorker) は、BackgroundLoginPolicy が許すとき (認証アプリ方式でこのアプリが鍵を持つ等)
+     * だけ新規ログインする。許さなければ、保存済みセッションが死んでいたら諦める。
      */
-    public void ensureLoggedIn(String username, String password, boolean userInitiated, ServiceCallback<Boolean> callback) {
+    public void ensureLoggedIn(String username, String password, AuthorizationContext context, ServiceCallback<Boolean> callback) {
         if (!AppConfigService.getInstance().isFeatureEnabled("moodle_enabled")) {
             callback.onError(AppConfigService.FEATURE_DISABLED_MESSAGE);
             return;
         }
         executor.execute(() -> {
             try {
-                ensureSession(username, password, userInitiated);
+                ensureSession(username, password, context);
                 postSuccess(callback, true);
             } catch (Exception e) {
                 postLoginError(callback, e);
@@ -229,21 +260,44 @@ public class MoodleService {
         });
     }
 
-    private String ensureSession(String username, String password, boolean userInitiated) throws Exception {
+    private String ensureSession(String username, String password, AuthorizationContext context) throws Exception {
+        if (AccountSwitch.isStale(username)) throw new AccountChangedException();
         // プロセス起動直後は cookie jar が空。前回の Moodle セッションを持ち越していれば、まずそれを
         // 入れて生存確認 (probe) にかける。生きていれば IdP ログイン (約 5 秒 + 大学側にログイン記録) を
         // 丸ごと省ける。死んでいれば probe が null を返して普通にログインする。
         String candidate = null;
         String host = moodleHost();
         if (!NetworkClient.hasCookies(host)) {
-            String stored = PreferenceManager.getInstance().getMoodleSessionCookieHeader();
-            if (!stored.isEmpty()) {
-                NetworkClient.injectCookieHeader(host, true, stored);
+            PreferenceManager prefs = PreferenceManager.getInstance();
+            String stored = prefs.getMoodleSessionCookies();
+            // 持ち主の無いもの (旧形式を含む) は誰のものか分からないので消す。別のアカウントのものは使わないだけで
+            // 残す (消すと、そのアカウントに戻ったときにログインし直しになる。復元は restore が断る)。
+            if (stored != null && !stored.isEmpty() && SpSessionCookies.ownerOf(stored) == null) {
+                prefs.setMoodleSessionCookies(null);
+            }
+            List<okhttp3.Cookie> restored = SpSessionCookies.restore(
+                    prefs.getMoodleSessionCookies(), username, host, System.currentTimeMillis());
+            if (!restored.isEmpty()) {
+                NetworkClient.addCookies(restored);
+                jarOwner = username.trim();
                 candidate = "restored";
             }
         }
-        return coordinator.session(resolveLoginMethod(), userInitiated, candidate,
-                key -> probeDashboardQuietly(), () -> doLogin(username, password));
+        return coordinator.session(sessionKey(username), context, candidate,
+                key -> probeDashboardQuietly(username), () -> doLogin(username, password, context, false), unattended(username, password));
+    }
+
+    /**
+     * SessionCoordinator に渡す鍵。方式と持ち主 (ユーザー名) の組。アカウントを切り替えている間に前のアカウントの
+     * 取得がセッションを作り直しても、新しいアカウントはそれを使わず、飛行中のログインにも合流しない。
+     */
+    private static Object sessionKey(String username) {
+        return java.util.Arrays.asList(resolveLoginMethod(), username.trim());
+    }
+
+    /** バックグラウンドの再ログインの判定。ログインに使うのと同じ ID / パスワードで作る。 */
+    private static SessionCoordinator.Unattended unattended(String username, String password) {
+        return BackgroundLoginPolicy.getInstance().forAccount("moodle", username, password);
     }
 
     private static String moodleHost() {
@@ -256,16 +310,16 @@ public class MoodleService {
      * 1 回、ログインし直して再実行する。資格情報は保存済みのものを使う (画面側は直前に
      * ensureLoggedIn を通しているので、通常ここでは通信しない)。
      */
-    private <T> T withSession(SessionBody<T> body) throws Exception {
+    private <T> T withSession(AuthorizationContext context, SessionBody<T> body) throws Exception {
         PreferenceManager prefs = PreferenceManager.getInstance();
         String user = prefs.getUsername();
         String pass = prefs.getPassword();
-        String key = ensureSession(user, pass, false);
+        String key = ensureSession(user, pass, context);
         try {
             return body.run(key);
         } catch (SessionExpiredException e) {
             coordinator.invalidate(key);
-            String fresh = ensureSession(user, pass, false);
+            String fresh = ensureSession(user, pass, context);
             return body.run(fresh);
         }
     }
@@ -277,20 +331,28 @@ public class MoodleService {
         if (e instanceof LoginFailure || AuthErrors.isInvalidCredentials(e.getMessage())) {
             postError(callback, e.getMessage());
         } else {
-            postError(callback, "接続エラー: " + e.getMessage());
+            postError(callback, AppStrings.get(R.string.moodle_error_connection_format, e.getMessage()));
         }
     }
 
-    /** ログイン手順 (旧方式 / IdP) を実行し、/my/ から sesskey を取り出して返す。 */
-    private String doLogin(String username, String password) throws Exception {
+    /**
+     * ログイン手順 (旧方式 / IdP) を実行し、/my/ から sesskey を取り出して返す。
+     *
+     * @param verifyPassword 資格情報の確認 (login)。IdP 方式では保存している SSO を使わず、必ずパスワードを送る。
+     */
+    private String doLogin(String username, String password, AuthorizationContext context, boolean verifyPassword) throws Exception {
         OkHttpClient client = NetworkClient.getCookieClient();
 
         Log.d(TAG, "Starting login for: " + username);
+        // ここに来るのは手持ちのセッションが無いか死んでいたとき。復元した cookie と新しく発行される cookie の
+        // Path / Domain が違うと置き換わらずに同名を二重に送るので、先に捨てる。
+        NetworkClient.removeCookiesIssuedTo(moodleHost());
+        jarOwner = username.trim();
 
         if (resolveLoginMethod() == LoginMethod.IDP) {
             // IdP 経由でセッション cookie を得たら、以降 (/my/ で sesskey 取得) は旧方式と共通。
             try {
-                loginViaIdP(username, password);
+                loginViaIdP(username, password, context, verifyPassword);
             } catch (Exception e) {
                 if (AuthErrors.isInvalidCredentials(e.getMessage())) throw new LoginFailure(e.getMessage());
                 throw e;
@@ -345,23 +407,31 @@ public class MoodleService {
                     || bodyWithoutScripts.contains("invalidlogin")
                     || bodyWithoutScripts.contains("id=\"loginerrormessage\"")) {
                 Log.e(TAG, "Login failed: invalid credentials");
-                throw new LoginFailure(INVALID_CREDENTIALS_MESSAGE);
+                throw new LoginFailure(invalidCredentialsMessage());
             }
         }
 
-        String key = probeDashboard();
+        String key = probeDashboard(username);
         Log.d(TAG, "Login successful");
-        // 次回起動で使い回すために保存する (ensureSession の candidate)。
-        PreferenceManager.getInstance().setMoodleSessionCookieHeader(NetworkClient.exportCookieHeader(moodleHost()));
         return key;
     }
 
     /**
      * GET /my/ で認証済みか確かめ、sesskey / userid を取り出して共有状態を更新する。
      * 未認証 (ログインページに戻される) なら LoginFailure。ログイン直後とセッション再確認の両方で使う。
+     *
+     * @param owner 保存するセッションの持ち主 (このセッションでログインしたユーザー名)。
      */
-    private String probeDashboard() throws Exception {
-        OkHttpClient client = NetworkClient.getCookieClient();
+    private String probeDashboard(String owner) throws Exception {
+        // リダイレクトは Moodle のホストの中だけ追う (iOS の sameHostRedirectsOnly と同じ)。未ログインだと
+        // /my/ は login → IdP (SAML) へ飛び、IdP まで追うと cookie jar に溜まった古い IdP cookie で IdP 内を
+        // ループして too many redirects で落ちる (2026-09-16 iOS 実機ログ)。別ホストへの 3xx で未ログインは
+        // 確定する。同じホスト内 (ダッシュボード無効時の /my/courses.php など) はログイン済みでも起きるので追う。
+        // newBuilder() は cookie jar を共有するので MoodleSession はそのまま送られる。
+        OkHttpClient client = NetworkClient.getCookieClient().newBuilder()
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .build();
         Request getDashboard = new Request.Builder()
                 .url(baseUrl() + "/my/")
                 .header("User-Agent", NetworkClient.getUserAgent())
@@ -370,7 +440,7 @@ public class MoodleService {
         String dashHtml;
         String dashUrl;
         int status;
-        try (Response resp = client.newCall(getDashboard).execute()) {
+        try (Response resp = NetworkClient.executeFollowingSameHostRedirects(client, getDashboard)) {
             dashHtml = resp.body().string();
             dashUrl = resp.request().url().toString();
             status = resp.code();
@@ -384,7 +454,7 @@ public class MoodleService {
                 || dashHtml.contains("id=\"login\"")
                 || dashHtml.contains("id=\"loginerrormessage\"")) {
             Log.e(TAG, "Session invalid after login POST");
-            throw new LoginFailure("セッション確立に失敗しました。再度お試しください。");
+            throw new LoginFailure(AppStrings.get(R.string.moodle_error_session_establishment_failed));
         }
 
         String key = extractMatch(dashHtml, "\"sesskey\":\"([^\"]+)\"");
@@ -397,17 +467,31 @@ public class MoodleService {
                 + ", userid: " + uid);
 
         if (key == null || key.isEmpty()) {
-            throw new LoginFailure("セッション情報の取得に失敗しました");
+            throw new LoginFailure(AppStrings.get(R.string.moodle_error_session_info_failed));
+        }
+        // 確認している間に別のアカウントのログインが jar を差し替えていたら、いま読んだのはそのアカウントの
+        // ダッシュボード。sesskey を返すと owner の取得が別人のコースや課題を読むので、ここで止める。
+        String current = jarOwner;
+        if (current != null && !current.equals(owner.trim())) {
+            throw new AccountChangedException();
         }
         sesskey = key;
         userid = uid;
+        // 次回起動で使い回すために保存する (ensureSession の candidate)。ログイン直後だけでなく生存確認の
+        // たびに書き直す: ALB の cookie は応答ごとに更新される。持ち主と一緒に保存する (SpSessionCookies)。
+        PreferenceManager.getInstance().setMoodleSessionCookies(SpSessionCookies.serialize(
+                NetworkClient.cookiesForHost(moodleHost()), System.currentTimeMillis(), owner));
         return key;
     }
 
     /** 生きていれば /my/ から取り直した sesskey (以前と違えばそちらが正)、死んでいれば null。 */
-    private String probeDashboardQuietly() {
+    private String probeDashboardQuietly(String owner) {
         try {
-            return probeDashboard();
+            return probeDashboard(owner);
+        } catch (AccountChangedException e) {
+            // 死んでいる (null) と答えると、SessionCoordinator が owner でログインし直し、切り替えた先の
+            // アカウントのセッションを消す。取得ごと失敗させる。
+            throw e;
         } catch (Exception e) {
             return null;
         }
@@ -422,36 +506,31 @@ public class MoodleService {
                 || response.contains("requireslogin");
     }
 
-    public void fetchCourses(ServiceCallback<List<MoodleCourse>> callback) {
+    public void fetchCourses(AuthorizationContext context, ServiceCallback<List<MoodleCourse>> callback) {
         if (!AppConfigService.getInstance().isFeatureEnabled("moodle_enabled")) {
             callback.onError(AppConfigService.FEATURE_DISABLED_MESSAGE);
             return;
         }
+        // 結果を渡す直前にアカウントが変わっていないか確かめる (前のアカウントの課題や科目を画面・キャッシュに出さない)。
+        AccountSwitch.Ticket ticket = AccountSwitch.ticket();
         executor.execute(() -> {
             try {
                 String jsonBody = "[{\"index\":0,\"methodname\":" +
                         "\"core_course_get_enrolled_courses_by_timeline_classification\"," +
                         "\"args\":{\"classification\":\"all\",\"limit\":0,\"offset\":0,\"sort\":\"fullname\"}}]";
 
-                String response = withSession(key -> ajaxCall(key,
+                String response = withSession(context, key -> ajaxCall(key,
                         "core_course_get_enrolled_courses_by_timeline_classification",
                         jsonBody));
 
-                Type listType = new TypeToken<List<Map<String, Object>>>() {}.getType();
-                List<Map<String, Object>> arr = gson.fromJson(response, listType);
-
-                if (arr == null || arr.isEmpty()) {
-                    postSuccess(callback, new ArrayList<>());
+                Map<String, Object> data;
+                try {
+                    data = MoodleAjax.firstData(gson, response);
+                } catch (MoodleAjax.AjaxException e) {
+                    Log.w(TAG, "core_course_get_enrolled_courses_by_timeline_classification failed: " + e.getMessage());
+                    postErrorForAccount(callback, AppStrings.get(R.string.courses_unavailable), ticket);
                     return;
                 }
-
-                Map<String, Object> first = arr.get(0);
-                if (Boolean.TRUE.equals(first.get("error"))) {
-                    postError(callback, "コース取得に失敗しました");
-                    return;
-                }
-
-                Map<String, Object> data = (Map<String, Object>) first.get("data");
                 List<Map<String, Object>> coursesRaw =
                         (List<Map<String, Object>>) data.get("courses");
 
@@ -469,19 +548,21 @@ public class MoodleService {
                     }
                 }
 
-                postSuccess(callback, courses);
+                postSuccessForAccount(callback, courses, ticket);
             } catch (Exception e) {
                 Log.e(TAG, "fetchCourses error", e);
-                postError(callback, e.getMessage());
+                postErrorForAccount(callback, e.getMessage(), ticket);
             }
         });
     }
 
-    public void fetchAssignments(ServiceCallback<List<Assignment>> callback) {
+    public void fetchAssignments(AuthorizationContext context, ServiceCallback<List<Assignment>> callback) {
         if (!AppConfigService.getInstance().isFeatureEnabled("moodle_enabled")) {
             callback.onError(AppConfigService.FEATURE_DISABLED_MESSAGE);
             return;
         }
+        // 結果を渡す直前にアカウントが変わっていないか確かめる (前のアカウントの課題や科目を画面・キャッシュに出さない)。
+        AccountSwitch.Ticket ticket = AccountSwitch.ticket();
         executor.execute(() -> {
             try {
                 long now = System.currentTimeMillis() / 1000;
@@ -490,45 +571,52 @@ public class MoodleService {
                         "\"args\":{\"limitnum\":50,\"timesortfrom\":" + now +
                         ",\"limittononsuspendedevents\":true}}]";
 
-                String response = withSession(key -> ajaxCall(key,
+                String response = withSession(context, key -> ajaxCall(key,
                         "core_calendar_get_action_events_by_timesort",
                         jsonBody));
 
-                Type listType = new TypeToken<List<Map<String, Object>>>() {}.getType();
-                List<Map<String, Object>> arr = gson.fromJson(response, listType);
-
-                List<Assignment> assignments = new ArrayList<>();
-                if (arr != null && !arr.isEmpty()) {
-                    Map<String, Object> first = arr.get(0);
-                    Map<String, Object> data = (Map<String, Object>) first.get("data");
-                    if (data != null) {
-                        List<Map<String, Object>> events =
-                                (List<Map<String, Object>>) data.get("events");
-                        if (events != null) {
-                            for (Map<String, Object> e : events) {
-                                Assignment a = new Assignment();
-                                a.setId(toInt(e.get("id")));
-                                a.setName(toStr(e.get("name")));
-                                a.setDueDate(toLong(e.get("timesort")));
-
-                                Map<String, Object> course =
-                                        (Map<String, Object>) e.get("course");
-                                if (course != null) {
-                                    a.setCourseName(toStr(course.get("fullname")));
-                                    a.setCourseId(toInt(course.get("id")));
-                                } else {
-                                    a.setCourseName("Moodle Event");
-                                }
-                                assignments.add(a);
-                            }
-                        }
-                    }
+                // 失敗を「課題 0 件」の成功にしない。空で保存すると、保存済みの課題とリマインダーが消える。
+                Map<String, Object> data;
+                try {
+                    data = MoodleAjax.firstData(gson, response);
+                } catch (MoodleAjax.AjaxException e) {
+                    Log.w(TAG, "core_calendar_get_action_events_by_timesort failed: " + e.getMessage());
+                    postErrorForAccount(callback, AppStrings.get(R.string.assignments_unavailable), ticket);
+                    return;
+                }
+                List<Map<String, Object>> events = data.get("events") instanceof List
+                        ? (List<Map<String, Object>>) data.get("events") : null;
+                if (events == null) {
+                    Log.w(TAG, "core_calendar_get_action_events_by_timesort failed: no events");
+                    postErrorForAccount(callback, AppStrings.get(R.string.assignments_unavailable), ticket);
+                    return;
                 }
 
-                postSuccess(callback, assignments);
+                List<Assignment> assignments = new ArrayList<>();
+                for (Map<String, Object> e : events) {
+                    Assignment a = new Assignment();
+                    a.setId(toInt(e.get("id")));
+                    a.setName(toStr(e.get("name")));
+                    a.setDueDate(toLong(e.get("timesort")));
+                    a.setUrl(MoodleEventUrl.pick(
+                            e.get("url") instanceof String ? (String) e.get("url") : null,
+                            e.get("viewurl") instanceof String ? (String) e.get("viewurl") : null));
+
+                    Map<String, Object> course =
+                            (Map<String, Object>) e.get("course");
+                    if (course != null) {
+                        a.setCourseName(toStr(course.get("fullname")));
+                        a.setCourseId(toInt(course.get("id")));
+                    } else {
+                        a.setCourseName("Moodle Event");
+                    }
+                    assignments.add(a);
+                }
+
+                postSuccessForAccount(callback, assignments, ticket);
             } catch (Exception e) {
                 Log.e(TAG, "fetchAssignments error", e);
-                postError(callback, e.getMessage());
+                postErrorForAccount(callback, e.getMessage(), ticket);
             }
         });
     }
@@ -557,16 +645,18 @@ public class MoodleService {
         return m.find() ? m.group(1) : null;
     }
 
-    public void fetchCourseContents(int courseId, ServiceCallback<List<com.shakenokirimi12.uoa_app.data.models.CourseSection>> callback) {
+    public void fetchCourseContents(int courseId, AuthorizationContext context, ServiceCallback<List<com.shakenokirimi12.uoa_app.data.models.CourseSection>> callback) {
         if (!AppConfigService.getInstance().isFeatureEnabled("moodle_enabled")) {
             callback.onError(AppConfigService.FEATURE_DISABLED_MESSAGE);
             return;
         }
+        // 結果を渡す直前にアカウントが変わっていないか確かめる (前のアカウントの課題や科目を画面・キャッシュに出さない)。
+        AccountSwitch.Ticket ticket = AccountSwitch.ticket();
         executor.execute(() -> {
             try {
-                postSuccess(callback, withSession(key -> fetchCourseContentsWithSession(key, courseId)));
+                postSuccessForAccount(callback, withSession(context, key -> fetchCourseContentsWithSession(key, courseId)), ticket);
             } catch (Exception e) {
-                postError(callback, e.getMessage());
+                postErrorForAccount(callback, e.getMessage(), ticket);
             }
         });
     }
@@ -633,7 +723,7 @@ public class MoodleService {
                 throw new SessionExpiredException();
             }
             if (resp.code() != 200 || resp.body() == null) {
-                throw new java.io.IOException("コースページを読み込めませんでした (HTTP " + resp.code() + ")");
+                throw new java.io.IOException(AppStrings.get(R.string.moodle_error_course_page_format, resp.code()));
             }
             html = resp.body().string();
         }
@@ -709,6 +799,36 @@ public class MoodleService {
     }
 
     private <T> void postError(ServiceCallback<T> cb, String msg) {
-        mainHandler.post(() -> cb.onError(msg != null ? msg : "不明なエラー"));
+        mainHandler.post(() -> cb.onError(msg != null ? msg : AppStrings.get(R.string.common_unknown_problem)));
+    }
+
+    /**
+     * ticket を控えてからアカウントが切り替わった (またはログアウトした) 取得の結果は渡さない。入口の確認
+     * (ensureSession の isStale) を通ったあとに切り替えが始まると、前のアカウントのセッションで取った課題や科目が
+     * 新しいアカウントの画面とキャッシュに入る。確かめるのは渡すメインスレッドの上 (切り替えもメインスレッドで決まる)。
+     */
+    private <T> void postSuccessForAccount(ServiceCallback<T> cb, T result, AccountSwitch.Ticket ticket) {
+        mainHandler.post(() -> {
+            if (ticket.isCurrent()) {
+                cb.onSuccess(result);
+            } else {
+                Log.w(TAG, "Dropping Moodle data fetched for the previous account");
+                cb.onError(new AccountChangedException().getMessage());
+            }
+        });
+    }
+
+    /**
+     * postSuccessForAccount の失敗版。前のアカウントの失敗 (ID / パスワードの誤りなど) をそのまま渡すと、画面が
+     * 今のアカウントの資格情報に誤りの印を付けてログインを止めるので、差し替える。
+     */
+    private <T> void postErrorForAccount(ServiceCallback<T> cb, String msg, AccountSwitch.Ticket ticket) {
+        mainHandler.post(() -> {
+            if (ticket.isCurrent()) {
+                cb.onError(msg != null ? msg : AppStrings.get(R.string.common_unknown_problem));
+            } else {
+                cb.onError(new AccountChangedException().getMessage());
+            }
+        });
     }
 }

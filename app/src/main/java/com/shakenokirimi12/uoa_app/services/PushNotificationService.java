@@ -6,15 +6,12 @@ import android.os.Looper;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import com.google.gson.reflect.TypeToken;
 import com.shakenokirimi12.uoa_app.BuildConfig;
-import com.shakenokirimi12.uoa_app.data.models.PushNotification;
 
-import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Supplier;
 
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -23,13 +20,20 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 public class PushNotificationService {
-    private static final String BASE_URL = "https://uoa-app-push.shakenokirimi12.workers.dev";
+    /** push の API の根 (uoa-app の /push)。利用状況 (services/usage/UsageStats) も同じ口に送る。 */
+    public static final String BASE_URL = "https://uoa-app.shakenokiri.me/push";
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Gson gson = new Gson();
-    private String deviceId;
+    /**
+     * 端末 ID は呼ぶたびに PreferenceManager から読む。以前は最初に読んだ値をフィールドに持っていたので、
+     * 「ログアウト」(prefs.clearAll) で ID が作り直されても、このプロセスの間は古い ID で登録・同期し、
+     * app-config (PreferenceManager から直接読む) とは別の ID を使っていた。
+     */
+    private final Supplier<String> deviceIds;
+    /** 問い合わせ ID (SupportId)。端末 ID と同じくログアウトで作り直されるので、送るたびに読む。null なら送らない。 */
+    private final Supplier<String> supportIds;
 
     private static PushNotificationService shared;
 
@@ -40,27 +44,23 @@ public class PushNotificationService {
      */
     public static synchronized PushNotificationService shared(android.content.Context context) {
         if (shared == null) {
-            shared = new PushNotificationService();
-            shared.init(com.shakenokirimi12.uoa_app.data.PreferenceManager
-                    .getInstance(context.getApplicationContext()).getDeviceId());
+            com.shakenokirimi12.uoa_app.data.PreferenceManager prefs =
+                    com.shakenokirimi12.uoa_app.data.PreferenceManager.getInstance(context.getApplicationContext());
+            shared = new PushNotificationService(prefs::getDeviceId, prefs::getSupportId);
         }
         return shared;
     }
 
-    public interface NotificationCallback {
-        void onResult(List<PushNotification> notifications, int unreadCount);
-        void onError(String message);
+    PushNotificationService(Supplier<String> deviceIds) {
+        this(deviceIds, () -> null);
     }
 
-    public void init(String storedDeviceId) {
-        if (storedDeviceId != null && !storedDeviceId.isEmpty()) {
-            this.deviceId = storedDeviceId;
-        } else {
-            this.deviceId = UUID.randomUUID().toString();
-        }
+    PushNotificationService(Supplier<String> deviceIds, Supplier<String> supportIds) {
+        this.deviceIds = deviceIds;
+        this.supportIds = supportIds;
     }
 
-    public String getDeviceId() { return deviceId; }
+    public String getDeviceId() { return deviceIds.get(); }
 
     public void registerDevice() { registerDevice(null); }
 
@@ -69,12 +69,17 @@ public class PushNotificationService {
      *                 を一切送れない。iOS の APNs deviceToken に相当する。
      */
     public void registerDevice(String fcmToken) {
+        // 端末 ID も問い合わせ ID も積む前に読む (新しい問い合わせ ID が前の端末の行に付かないように)。
+        final String deviceId = getDeviceId();
+        final String supportId = supportIds.get();
         executor.execute(() -> {
             try {
                 JsonObject body = new JsonObject();
                 body.addProperty("deviceId", deviceId);
                 body.addProperty("os", "Android");
                 body.addProperty("appVersion", BuildConfig.VERSION_NAME);
+                // 管理画面で問い合わせ ID から端末を引くため (SupportId)。
+                if (supportId != null) body.addProperty("supportId", supportId);
                 if (fcmToken != null && !fcmToken.isEmpty()) {
                     body.addProperty("fcmToken", fcmToken);
                 }
@@ -82,54 +87,6 @@ public class PushNotificationService {
                 OkHttpClient client = NetworkClient.getNoCookieClient();
                 Request req = new Request.Builder()
                         .url(BASE_URL + "/api/devices/register")
-                        .post(RequestBody.create(body.toString(), JSON))
-                        .build();
-                try (Response resp = client.newCall(req).execute()) {
-                    // ignore result
-                }
-            } catch (Exception ignored) {}
-        });
-    }
-
-    public void fetchNotifications(NotificationCallback callback) {
-        executor.execute(() -> {
-            try {
-                OkHttpClient client = NetworkClient.getNoCookieClient();
-                Request req = new Request.Builder()
-                        .url(BASE_URL + "/api/notifications?deviceId=" + deviceId)
-                        .build();
-
-                try (Response resp = client.newCall(req).execute()) {
-                    String json = resp.body().string();
-                    JsonObject obj = gson.fromJson(json, JsonObject.class);
-                    JsonArray arr = obj.getAsJsonArray("notifications");
-                    List<PushNotification> list = gson.fromJson(arr,
-                            new TypeToken<List<PushNotification>>() {}.getType());
-                    if (list == null) list = new ArrayList<>();
-
-                    int unread = 0;
-                    for (PushNotification n : list) {
-                        if (!n.isRead()) unread++;
-                    }
-                    int finalUnread = unread;
-                    List<PushNotification> finalList = list;
-                    mainHandler.post(() -> callback.onResult(finalList, finalUnread));
-                }
-            } catch (Exception e) {
-                mainHandler.post(() -> callback.onError(e.getMessage()));
-            }
-        });
-    }
-
-    public void markAsRead(String notificationId) {
-        executor.execute(() -> {
-            try {
-                JsonObject body = new JsonObject();
-                body.addProperty("deviceId", deviceId);
-
-                OkHttpClient client = NetworkClient.getNoCookieClient();
-                Request req = new Request.Builder()
-                        .url(BASE_URL + "/api/notifications/" + notificationId + "/read")
                         .post(RequestBody.create(body.toString(), JSON))
                         .build();
                 try (Response resp = client.newCall(req).execute()) {
@@ -171,6 +128,9 @@ public class PushNotificationService {
      *                 消すと cron が拾う前の再同期で黙って消える)。止めるときだけは全部消す。
      */
     public void syncAssignmentReminders(List<AssignmentReminder> reminders, boolean clearAll, SyncCallback callback) {
+        // 呼んだ時点の ID で送る。ログアウトは予約を消す同期をここへ積んでから prefs.clearAll() で ID を
+        // 作り直すので、executor の中で読むと新しい ID の (空の) 予約を消すことになる。
+        final String deviceId = getDeviceId();
         executor.execute(() -> {
             boolean ok = false;
             try {
@@ -207,12 +167,50 @@ public class PushNotificationService {
             }
             if (callback != null) {
                 final boolean result = ok;
-                mainHandler.post(() -> callback.onDone(result));
+                // 使う所で作る (フィールドで作ると、Looper の無い JVM のテストで生成できない)。
+                new Handler(Looper.getMainLooper()).post(() -> callback.onDone(result));
             }
         });
     }
 
+    /**
+     * サーバーからこの端末の行と、それに紐付く予約・エラーレポートを消す (DELETE /api/devices/:deviceId)。
+     * ログアウトは prefs.clearAll() で ID を作り直すので、その前に呼ぶ (呼んだ時点の ID を消す)。
+     * 消さないと古い ID の行が FCM トークンを持ったまま残り、再ログインするまで一斉配信がそちらにも届く。
+     * 失敗しても止めない。残った行のトークンは、新しい ID で登録したときにサーバーが外す。
+     */
+    public void deleteDevice() {
+        deleteDevice(null);
+    }
+
+    /** onFailure: サーバーの行を消せなかったとき (HTTP の失敗・通信の失敗) に、executor のスレッドで呼ぶ。 */
+    public void deleteDevice(@androidx.annotation.Nullable Runnable onFailure) {
+        final String deviceId = getDeviceId();
+        executor.execute(() -> {
+            boolean ok = false;
+            try {
+                Request req = new Request.Builder()
+                        .url(BASE_URL + "/api/devices/" + java.net.URLEncoder.encode(deviceId, "UTF-8"))
+                        .delete()
+                        .build();
+                OkHttpClient client = NetworkClient.getNoCookieClient().newBuilder()
+                        .callTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                        .build();
+                try (Response resp = client.newCall(req).execute()) {
+                    // 無い (404) なら、消したいものは既に無い。
+                    ok = resp.isSuccessful() || resp.code() == 404;
+                    if (!resp.isSuccessful()) android.util.Log.w("PushNotificationService", "devices delete: HTTP " + resp.code());
+                }
+            } catch (Exception e) {
+                android.util.Log.w("PushNotificationService", "devices delete failed: " + e.getMessage());
+            }
+            if (!ok && onFailure != null) onFailure.run();
+        });
+    }
+
     public void reportError(String title, String message) {
+        final String deviceId = getDeviceId();
+        final String supportId = supportIds.get();
         executor.execute(() -> {
             try {
                 JsonObject body = new JsonObject();
@@ -221,6 +219,7 @@ public class PushNotificationService {
                 body.addProperty("message", message);
                 body.addProperty("os", "Android");
                 body.addProperty("appVersion", BuildConfig.VERSION_NAME);
+                if (supportId != null) body.addProperty("supportId", supportId);
 
                 OkHttpClient client = NetworkClient.getNoCookieClient();
                 Request req = new Request.Builder()

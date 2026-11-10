@@ -1,5 +1,6 @@
 package com.shakenokirimi12.uoa_app.ui.home;
 
+import com.shakenokirimi12.uoa_app.services.AuthorizationContext;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -18,6 +19,7 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
 import com.google.android.material.color.MaterialColors;
 import com.shakenokirimi12.uoa_app.R;
+import com.shakenokirimi12.uoa_app.ui.util.FetchStatus;
 import com.shakenokirimi12.uoa_app.data.DataCache;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.Assignment;
@@ -43,12 +45,21 @@ import java.util.List;
 import java.util.Locale;
 
 public class HomeFragment extends Fragment {
+    /** IdP のチュートリアルから戻ったとき、キャッシュに関係なく取り直す。 */
+    public static final String KEY_FORCE_SYNC = "force_sync";
+
 
     private SwipeRefreshLayout swipeRefresh;
     private RecyclerView recyclerClasses;
     private RecyclerView recyclerAssignments;
     private TextView textNoClasses;
     private TextView textNoAssignments;
+    /** 取得失敗の帯。失敗した側のデータがいつのものかを出す。 */
+    private View fetchNotice;
+    private boolean eventsFailed;
+    private boolean assignmentsFailed;
+    /** 未ログイン。「授業はありません」と言わない。 */
+    private boolean notLoggedIn;
     private TextView textDate;
     private TextView textTodayHint;
 
@@ -77,7 +88,6 @@ public class HomeFragment extends Fragment {
     private final Calendar selectedDate = Calendar.getInstance();
     private List<CalendarEvent> allEvents = new ArrayList<>();
     private List<Assignment> allAssignments = new ArrayList<>();
-    private final SimpleDateFormat dateFmt = new SimpleDateFormat("M月d日 (E)", Locale.JAPANESE);
 
     @Nullable
     @Override
@@ -96,6 +106,7 @@ public class HomeFragment extends Fragment {
         recyclerAssignments = view.findViewById(R.id.recycler_assignments);
         textNoClasses = view.findViewById(R.id.text_no_classes);
         textNoAssignments = view.findViewById(R.id.text_no_assignments);
+        fetchNotice = view.findViewById(R.id.fetch_notice);
         textDate = view.findViewById(R.id.text_date);
         textTodayHint = view.findViewById(R.id.text_today_hint);
 
@@ -166,13 +177,20 @@ public class HomeFragment extends Fragment {
         DataCache cache = DataCache.getInstance(requireContext());
         allEvents = cache.loadEvents();
         allAssignments = cache.loadAssignments();
-        if (!allEvents.isEmpty() || !allAssignments.isEmpty()) {
-            filterAndDisplay();
-        }
+        // 空でも描く。キャッシュが新しいと syncData は取得を飛ばして何も描かないので、ここで描かないと
+        // 「今日の授業はありません」も件数も出ない白い画面になる (SyncWorker が空の一覧を保存した直後など)。
+        PreferenceManager loginPrefs = PreferenceManager.getInstance(requireContext());
+        notLoggedIn = loginPrefs.getUsername().isEmpty() || loginPrefs.getPassword().isEmpty();
+        filterAndDisplay();
 
         // Every tab switch recreates this fragment; hitting CampusSquare / Moodle each time is
         // needless load on the university servers, so automatic loads honor the cache age.
-        syncData(false);
+        // IdP のチュートリアルで「今すぐログインする」を押して戻ってきたときだけは、キャッシュに
+        // 関係なく取り直してログインさせる。
+        Boolean forceSync = Navigation.findNavController(view).getCurrentBackStackEntry() != null
+                ? Navigation.findNavController(view).getCurrentBackStackEntry().getSavedStateHandle().remove(KEY_FORCE_SYNC)
+                : null;
+        syncData(Boolean.TRUE.equals(forceSync));
         loadCafeteriaMenu(false);
     }
 
@@ -182,7 +200,8 @@ public class HomeFragment extends Fragment {
     }
 
     private void updateDateDisplay() {
-        textDate.setText(dateFmt.format(selectedDate.getTime()));
+        textDate.setText(new SimpleDateFormat(getString(R.string.common_format_date_month_day_weekday), Locale.JAPANESE)
+                .format(selectedDate.getTime()));
 
         Calendar today = Calendar.getInstance();
         boolean isToday = selectedDate.get(Calendar.YEAR) == today.get(Calendar.YEAR)
@@ -197,10 +216,10 @@ public class HomeFragment extends Fragment {
             long diffMs = System.currentTimeMillis() - lastSync;
             long diffMin = diffMs / 60000;
             String timeAgo;
-            if (diffMin < 1) timeAgo = "たった今";
-            else if (diffMin < 60) timeAgo = diffMin + "分前";
-            else if (diffMin < 1440) timeAgo = (diffMin / 60) + "時間前";
-            else timeAgo = (diffMin / 1440) + "日前";
+            if (diffMin < 1) timeAgo = getString(R.string.home_last_synced_just_now);
+            else if (diffMin < 60) timeAgo = getString(R.string.home_last_synced_minutes_ago, diffMin);
+            else if (diffMin < 1440) timeAgo = getString(R.string.home_last_synced_hours_ago, diffMin / 60);
+            else timeAgo = getString(R.string.home_last_synced_days_ago, diffMin / 1440);
 
             textLastSync.setText(getString(R.string.home_last_synced, timeAgo));
             textLastSync.setVisibility(View.VISIBLE);
@@ -225,7 +244,13 @@ public class HomeFragment extends Fragment {
         }
         List<GroupedClass> grouped = GroupedClass.groupBySubject(dayClasses);
         classAdapter.setItems(grouped);
-        textNoClasses.setVisibility(grouped.isEmpty() ? View.VISIBLE : View.GONE);
+        // 一度も取れたものが無いなら「授業はありません」とは言えない (取得中なら何も言わない)。
+        DataCache cache = DataCache.getInstance(requireContext());
+        FetchStatus.Empty classesEmpty = FetchStatus.emptyKind(!notLoggedIn, eventsFailed,
+                cache.fetchedAt(DataCache.Dataset.EVENTS));
+        FetchStatus.Empty assignmentsEmpty = FetchStatus.emptyKind(!notLoggedIn, assignmentsFailed,
+                cache.fetchedAt(DataCache.Dataset.ASSIGNMENTS));
+        showEmpty(textNoClasses, grouped.isEmpty(), classesEmpty, R.string.classes_unavailable, R.string.home_no_classes);
         recyclerClasses.setVisibility(grouped.isEmpty() ? View.GONE : View.VISIBLE);
 
         List<Assignment> dayAssignments = new ArrayList<>();
@@ -237,12 +262,38 @@ public class HomeFragment extends Fragment {
             }
         }
         assignmentAdapter.setItems(dayAssignments);
-        textNoAssignments.setVisibility(dayAssignments.isEmpty() ? View.VISIBLE : View.GONE);
+        showEmpty(textNoAssignments, dayAssignments.isEmpty(), assignmentsEmpty,
+                R.string.assignments_unavailable, R.string.home_no_assignments);
         recyclerAssignments.setVisibility(dayAssignments.isEmpty() ? View.GONE : View.VISIBLE);
 
         // Update summary cards
-        textClassCount.setText(String.valueOf(grouped.size()));
-        textAssignmentCount.setText(String.valueOf(dayAssignments.size()));
+        textClassCount.setText(classesEmpty == FetchStatus.Empty.NONE ? String.valueOf(grouped.size()) : "-");
+        textAssignmentCount.setText(assignmentsEmpty == FetchStatus.Empty.NONE
+                ? String.valueOf(dayAssignments.size()) : "-");
+    }
+
+    /** 空の一覧の文言。取得中 (LOADING) は何も出さない。 */
+    private static void showEmpty(TextView view, boolean empty, FetchStatus.Empty kind,
+                                  int unavailableRes, int noneRes) {
+        switch (kind) {
+            case NOT_LOGGED_IN: view.setText(R.string.not_logged_in_empty); break;
+            case UNAVAILABLE: view.setText(unavailableRes); break;
+            case NONE: view.setText(noneRes); break;
+            default: break;
+        }
+        view.setVisibility(empty && kind != FetchStatus.Empty.LOADING ? View.VISIBLE : View.GONE);
+    }
+
+    /** 失敗した側のうち、古い方の最終更新時刻を出す。どちらも成功していれば消す。 */
+    private void updateFetchNotice() {
+        if (!eventsFailed && !assignmentsFailed) {
+            FetchStatus.hide(fetchNotice);
+            return;
+        }
+        DataCache cache = DataCache.getInstance(requireContext());
+        long events = eventsFailed ? cache.fetchedAt(DataCache.Dataset.EVENTS) : Long.MAX_VALUE;
+        long assignments = assignmentsFailed ? cache.fetchedAt(DataCache.Dataset.ASSIGNMENTS) : Long.MAX_VALUE;
+        FetchStatus.showFailure(fetchNotice, Math.min(events, assignments));
     }
 
     /** Number of in-flight fetches started by syncData(); the spinner stays until it reaches 0. */
@@ -259,18 +310,22 @@ public class HomeFragment extends Fragment {
      * @param force true for pull-to-refresh: always fetch. false for automatic loads: skip each
      *              dataset that was fetched (by this screen or SyncWorker) within the cache window.
      */
+    /** キャッシュに関係なく取り直す (MainActivity.syncAfterKeyImport)。 */
+    public void syncNow() {
+        if (getView() == null) return;
+        syncData(true);
+    }
+
     private void syncData(boolean force) {
         PreferenceManager prefs = PreferenceManager.getInstance(requireContext());
         String user = prefs.getUsername();
         String pass = prefs.getPassword();
 
-        if (user.isEmpty() || pass.isEmpty()) {
+        notLoggedIn = user.isEmpty() || pass.isEmpty();
+        if (notLoggedIn) {
             swipeRefresh.setRefreshing(false);
             syncStatusBar.setVisibility(View.GONE);
-            textNoClasses.setVisibility(View.VISIBLE);
-            textNoAssignments.setVisibility(View.VISIBLE);
-            textClassCount.setText("0");
-            textAssignmentCount.setText("0");
+            filterAndDisplay();
             return;
         }
 
@@ -303,48 +358,53 @@ public class HomeFragment extends Fragment {
         if (prefs.isCredentialsInvalid()) {
             swipeRefresh.setRefreshing(false);
             syncStatusBar.setVisibility(View.GONE);
-            showError(MoodleService.INVALID_CREDENTIALS_MESSAGE);
+            showError(MoodleService.invalidCredentialsMessage());
+            eventsFailed |= fetchEvents;
+            assignmentsFailed |= fetchAssignments;
+            updateFetchNotice();
+            filterAndDisplay();
             return;
         }
 
         // += so a pull-to-refresh during an in-flight sync does not hide the spinner early.
         pendingFetches += (fetchEvents ? 1 : 0) + (fetchAssignments ? 1 : 0);
 
-        if (fetchEvents) csService.fetchCalendarEvents(user, pass, new ServiceCallback<List<CalendarEvent>>() {
-            @Override
-            public void onSuccess(List<CalendarEvent> events) {
-                if (!isAdded()) return;
-                allEvents = events;
+        // Moodle → CampusSquare の順に直列にする (バックグラウンドの同期と同じ)。2 本目は 1 本目が保存した IdP の SSO で
+        // 入るので、OTP は多くて 1 回で済む。1 本目で OTP の入力を取り消したら、2 本目ではログインを始めない
+        // (取り消した直後に、もう一度入力を求めない。SPEC.md「5. 前面ログイン」)。
+        long syncStartedAt = System.currentTimeMillis();
+        Runnable fetchCalendar = !fetchEvents ? null : () -> {
+            if (!isAdded()) return;
+            if (com.shakenokirimi12.uoa_app.services.idp.IdpLoginGate.shared().cancelledSince(syncStartedAt)) {
+                eventsFailed = true;
+                updateFetchNotice();
                 filterAndDisplay();
-                // ClassLiveUpdate はキャッシュを読むので、保存してから呼ぶ。
-                DataCache.getInstance(requireContext()).saveEvents(events);
-                ClassLiveUpdate.refresh(requireContext());
-                com.shakenokirimi12.uoa_app.widget.ClassScheduleWidgetProvider.refresh(requireContext());
                 fetchFinished();
+                return;
             }
+            fetchCalendarEvents(user, pass, force);
+        };
 
-            @Override
-            public void onError(String message) {
-                if (!isAdded()) return;
-                textNoClasses.setVisibility(View.VISIBLE);
-                fetchFinished();
-            }
-        });
-
-        if (fetchAssignments) moodleService.ensureLoggedIn(user, pass, true, new ServiceCallback<Boolean>() {
+        // 引っ張って更新 (と IdP のチュートリアルの「今すぐログインする」) は利用者のやり直し。直前のログインの
+        // 失敗による 60 秒の待ちを、それぞれの取得の直前に解く (allowLoginRetry)。画面を開いただけの取得では解かない。
+        if (fetchAssignments && force) moodleService.allowLoginRetry();
+        if (fetchAssignments) moodleService.ensureLoggedIn(user, pass, AuthorizationContext.INTERACTIVE, new ServiceCallback<Boolean>() {
             @Override
             public void onSuccess(Boolean result) {
                 if (!isAdded()) return;
-                moodleService.fetchAssignments(new ServiceCallback<List<Assignment>>() {
+                if (fetchCalendar != null) fetchCalendar.run();
+                moodleService.fetchAssignments(AuthorizationContext.INTERACTIVE, new ServiceCallback<List<Assignment>>() {
                     @Override
                     public void onSuccess(List<Assignment> assignments) {
                         if (!isAdded()) return;
                         allAssignments = assignments;
+                        assignmentsFailed = false;
+                        DataCache.getInstance(requireContext()).saveAssignments(assignments);
+                        updateFetchNotice();
                         filterAndDisplay();
                         fetchFinished();
                         prefs.setLastSync(System.currentTimeMillis());
                         showLastSyncTime();
-                        DataCache.getInstance(requireContext()).saveAssignments(assignments);
                         com.shakenokirimi12.uoa_app.services.push.AssignmentReminderSync.sync(requireContext(), assignments);
                         com.shakenokirimi12.uoa_app.services.notification.AssignmentCountdownNotifier.post(requireContext(), assignments);
                     }
@@ -353,7 +413,9 @@ public class HomeFragment extends Fragment {
                     public void onError(String message) {
                         if (!isAdded()) return;
                         fetchFinished();
-                        showError(message);
+                        assignmentsFailed = true;
+                        updateFetchNotice();
+                        filterAndDisplay();
                     }
                 });
             }
@@ -363,7 +425,45 @@ public class HomeFragment extends Fragment {
                 if (!isAdded()) return;
                 MoodleService.markInvalidIfCredentialsError(requireContext(), message);
                 fetchFinished();
-                showError(message);
+                // ID/PW 誤りだけは直し方を伝える。それ以外は帯で足りる。
+                if (com.shakenokirimi12.uoa_app.services.AuthErrors.isInvalidCredentials(message)) showError(message);
+                assignmentsFailed = true;
+                updateFetchNotice();
+                filterAndDisplay();
+                if (fetchCalendar != null) fetchCalendar.run();
+            }
+        });
+        else if (fetchCalendar != null) fetchCalendar.run();
+    }
+
+    /** @param userRetry 利用者のやり直し (引っ張って更新など)。直前のログインの失敗による待ちを解いてから取る。 */
+    private void fetchCalendarEvents(String user, String pass, boolean userRetry) {
+        if (userRetry) csService.allowLoginRetry();
+        csService.fetchCalendarEvents(user, pass, AuthorizationContext.INTERACTIVE, new ServiceCallback<List<CalendarEvent>>() {
+            @Override
+            public void onSuccess(List<CalendarEvent> events) {
+                if (!isAdded()) return;
+                allEvents = events;
+                eventsFailed = false;
+                DataCache.getInstance(requireContext()).saveEvents(events);
+                // 取り直した時間割で、終わった授業の「欠席？（要確認）」を見る。
+                com.shakenokirimi12.uoa_app.services.attendance.AutoAbsenceRunner.evaluateAsync(requireContext());
+                updateFetchNotice();
+                filterAndDisplay();
+                startClassNotification(events);
+                com.shakenokirimi12.uoa_app.widget.ClassScheduleWidgetProvider.refresh(requireContext());
+                fetchFinished();
+            }
+
+            @Override
+            public void onError(String message) {
+                if (!isAdded()) return;
+                // 以前はここで「今日の授業はありません」を出していた。取れなかっただけなので、
+                // キャッシュ (あれば) を出したまま、いつの情報かを帯で示す。
+                eventsFailed = true;
+                updateFetchNotice();
+                filterAndDisplay();
+                fetchFinished();
             }
         });
     }
@@ -391,7 +491,7 @@ public class HomeFragment extends Fragment {
             @Override
             public void onError(String message) {
                 if (!isAdded()) return;
-                textMenuLoading.setText("メニュー取得失敗");
+                textMenuLoading.setText(R.string.home_menu_failed);
             }
         });
     }
@@ -399,7 +499,7 @@ public class HomeFragment extends Fragment {
     private void showTodayMenu(GakushokuMenu menu) {
         GakushokuMenu.Day today = menu.today();
         if (today == null || !today.hasContent()) {
-            textMenuLoading.setText("本日の掲載はありません");
+            textMenuLoading.setText(R.string.home_menu_none_today);
             return;
         }
         textMenuLoading.setVisibility(View.GONE);
@@ -412,6 +512,10 @@ public class HomeFragment extends Fragment {
         MenuAdapter.bindCategoryRows(layoutMenuRows, today);
     }
 
+    private void startClassNotification(List<CalendarEvent> events) {
+        if (!isAdded()) return;
+        ClassLiveUpdate.refresh(requireContext());
+    }
     private void showError(String message) {
         if (isAdded()) {
             Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show();

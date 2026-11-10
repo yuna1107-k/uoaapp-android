@@ -14,6 +14,9 @@ import androidx.appcompat.app.AppCompatDelegate;
 import androidx.core.os.LocaleListCompat;
 
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
+import com.shakenokirimi12.uoa_app.services.AppConfigService;
+import com.shakenokirimi12.uoa_app.services.ForceUpdateGate;
+import com.shakenokirimi12.uoa_app.ui.ForceUpdateActivity;
 
 public class UoaApplication extends Application {
     /**
@@ -26,11 +29,32 @@ public class UoaApplication extends Application {
     @Nullable
     public static Activity getForegroundActivity() { return foregroundActivity; }
 
+    /** アプリの Context。サービス層からローカル通知を出すのに使う (AuthNotices)。onCreate より前は null。 */
+    @Nullable private static volatile android.content.Context appContext;
+
+    @Nullable
+    public static android.content.Context getAppContext() { return appContext; }
+
+    /** 開始している (画面に見えている) Activity の数。0 から 1 になったときがアプリの前面復帰。 */
+    private int startedActivities = 0;
+
     @Override
     public void onCreate() {
         super.onCreate();
+        appContext = getApplicationContext();
+        // 同期結果の通知は消した。端末の通知設定に、もう使わないチャンネルを残さない。
+        getSystemService(android.app.NotificationManager.class)
+                .deleteNotificationChannel(com.shakenokirimi12.uoa_app.services.sync.SyncWorker.REMOVED_CHANNEL_ID);
+        // 端末に残っている強制アップデートの条件を、最初の画面より先に読む (取得を待たずに止めるため)。
+        ForceUpdateGate gate = ForceUpdateGate.getInstance(this);
         registerActivityLifecycleCallbacks(new ActivityLifecycleCallbacks() {
-            @Override public void onActivityResumed(@NonNull Activity activity) { foregroundActivity = activity; }
+            @Override public void onActivityResumed(@NonNull Activity activity) {
+                foregroundActivity = activity;
+                // どの画面 (初期設定・アプリ内ブラウザ・通知から開いた画面) から入っても止める。
+                if (gate.isBlocked() && !(activity instanceof ForceUpdateActivity)) {
+                    ForceUpdateActivity.show(activity);
+                }
+            }
 
             @Override public void onActivityPaused(@NonNull Activity activity) {
                 // 別の Activity が既に resume していたら、そちらを消さない。
@@ -41,13 +65,51 @@ public class UoaApplication extends Application {
                 if (foregroundActivity == activity) foregroundActivity = null;
             }
 
+            @Override public void onActivityStarted(@NonNull Activity activity) {
+                // 起動時と前面復帰のたびに、どの画面から入ってもリモート設定 (強制更新・メンテナンス・
+                // killswitch) を取り直す。以前は MainActivity.onResume だけで、初期設定や通知から開いた
+                // 画面では取り直していなかった。
+                if (startedActivities++ == 0) {
+                    AppConfigService.getInstance().refresh(activity);
+                    // 前日までの利用状況があれば送る (1 日 1 回。送る分が無ければ通信しない)。
+                    com.shakenokirimi12.uoa_app.services.usage.UsageStats.sendIfDueAsync(activity);
+                    // 登録し直すと今の状態 (中か外か) が届き、そこで「欠席？（要確認）」の判定をし直す
+                    // (GeofenceReceiver)。判定は時間割を取った後にも走る (授業の後に取った時間割だけを使う)。
+                    try {
+                        com.shakenokirimi12.uoa_app.services.LocationGeofenceService.startIfEnabled(activity);
+                    } catch (RuntimeException e) {
+                        android.util.Log.e("UoaApplication", "Could not re-register the geofence", e);
+                    }
+                }
+            }
+
+            @Override public void onActivityStopped(@NonNull Activity activity) {
+                if (startedActivities > 0) startedActivities--;
+            }
+
             @Override public void onActivityCreated(@NonNull Activity activity, @Nullable Bundle state) { }
-            @Override public void onActivityStarted(@NonNull Activity activity) { }
-            @Override public void onActivityStopped(@NonNull Activity activity) { }
             @Override public void onActivitySaveInstanceState(@NonNull Activity activity, @NonNull Bundle out) { }
+        });
+        // 画面を開いている間に取得の結果で止める必要が出たら、その場で差し替える。
+        gate.blocked().observeForever(blocked -> {
+            Activity current = foregroundActivity;
+            if (Boolean.TRUE.equals(blocked) && gate.isBlocked()
+                    && current != null && !(current instanceof ForceUpdateActivity) && !current.isFinishing()) {
+                ForceUpdateActivity.show(current);
+            }
         });
         // Context を持たないサービス層が PreferenceManager.getInstance() で取れるよう、ここで初期化する。
         PreferenceManager.getInstance(this);
+        // アカウントに分ける前の出席の記録を、ログインしているアカウントに移す。ログインしていなければそのまま
+        // 残し、次にログインしたときに移す (AttendanceManager)。
+        com.shakenokirimi12.uoa_app.data.AttendanceManager.getInstance(this).migrateLegacyRecords();
+        // 自動の欠席の印も、versionCode 7 のユーザー名そのままのキーから移す (自動出席が OFF でも、学籍番号の
+        // キーを OS のバックアップに残さない)。
+        com.shakenokirimi12.uoa_app.services.attendance.AutoAbsenceRunner.migrateRawUsernameKeys(this);
+        // 自動の欠席の根拠。前の終了 (強制停止など) と再起動で監視が止まっていた区間を残す。
+        com.shakenokirimi12.uoa_app.services.attendance.PresenceEvidenceLog.onProcessStart(this);
+        // 以前の版がアプリ内ブラウザの Basic 認証で WebView の http_auth.db (平文) に書いたパスワードを消す。
+        com.shakenokirimi12.uoa_app.ui.browser.InAppBrowserActivity.clearLegacyHttpAuthOnce(this);
         // The UI is Japanese only. Without a Japanese locale on the context, Android picks
         // Chinese glyph forms for kanji (Han unification), which is what an English-locale
         // device or emulator shows. Pin the per-app locale so text always renders with the

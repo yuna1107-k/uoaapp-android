@@ -5,6 +5,7 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 
+import com.shakenokirimi12.uoa_app.R;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.Assignment;
 import com.shakenokirimi12.uoa_app.services.AppConfigService;
@@ -49,36 +50,87 @@ public final class AssignmentReminderSync {
         return PushNotificationService.shared(ctx);
     }
 
+    /**
+     * sync の「送ってよいかの確認・持っている印・送信の積み込み」と clear の「印の確認・削除の積み込み」を
+     * 互いに割り込ませない。設定は clear を呼ぶ前に書き換わるので (設定画面の切り替え)、どちらが先にロックを
+     * 取っても、同期を積んだあとに削除が積まれるか、同期が積まれないかのどちらかになる。ロックの外で確かめると、
+     * 確認のあとに通知を止めた clear が「何も持っていない」と見て戻り、そのあと積まれた予約がサーバーに残る。
+     * 送信は PushNotificationService の 1 本の executor に積んだ順に出る。
+     */
+    private static final Object lock = new Object();
+
+    /**
+     * sync が「持っている」と記録した回数 (lock で守る)。削除の応答はメインスレッドに遅れて届くので、そのあいだに
+     * 次の同期が積まれていたら印を下ろさない。下ろすと、次の clear (ログアウトなど) が何も送らずに戻り、
+     * あとから送った予約がサーバーに残る。
+     */
+    private static long holdingSeq;
+
+    private static boolean enabled(PreferenceManager prefs) {
+        return prefs.isAssignmentNotifyEnabled()
+                && AppConfigService.getInstance().isFeatureEnabled("notifications_enabled")
+                && AppConfigService.getInstance().isFeatureEnabled("assignment_reminders_push");
+    }
+
     /** 課題の取得に成功したあとに呼ぶ。 */
     public static void sync(@NonNull Context context, @NonNull List<Assignment> assignments) {
         Context ctx = context.getApplicationContext();
         PreferenceManager prefs = PreferenceManager.getInstance(ctx);
 
-        boolean enabled = prefs.isAssignmentNotifyEnabled()
-                && AppConfigService.getInstance().isFeatureEnabled("notifications_enabled")
-                && AppConfigService.getInstance().isFeatureEnabled("assignment_reminders_push");
-        if (!enabled) {
+        if (!enabled(prefs)) {
             clear(ctx);
             return;
         }
 
         List<PushNotificationService.AssignmentReminder> reminders = build(ctx, prefs, assignments);
-        push(ctx).syncAssignmentReminders(reminders, false, ok -> {
-            // 「サーバーは空」と言い切れるのは clearAll のときだけ。通常の再同期は期限の来た
-            // 未配信分を残すので、空を送っても空になったとは限らない。
-            if (ok && !reminders.isEmpty()) prefs.setServerHoldingReminders(true);
-            Log.d(TAG, "synced " + reminders.size() + " reminders, ok=" + ok);
-        });
+        synchronized (lock) {
+            // build のあいだに通知を止めた (設定・killswitch) かもしれない。送らずに、持っている予約を消す。
+            // 設定を止めた clear はもう戻っているかもしれず、killswitch は clear を呼ばないので、ここで消す。
+            if (!enabled(prefs)) {
+                clearLocked(ctx, prefs, null);
+                return;
+            }
+            // 送る前に「持っている」と記録する。応答を待ってから記録すると、送っている最中のログアウトや
+            // アカウントの切り替えで clear が何も送らずに戻り、そのあと届いた前のアカウントの予約が残る。
+            // 送信が失敗しても印は残す (次の clear が余分に 1 回送るだけ)。
+            if (!reminders.isEmpty()) {
+                holdingSeq++;
+                prefs.setServerHoldingReminders(true);
+            }
+            push(ctx).syncAssignmentReminders(reminders, false,
+                    ok -> Log.d(TAG, "synced " + reminders.size() + " reminders, ok=" + ok));
+        }
     }
 
-    /** 通知を止めるとき (設定 OFF・ログアウト) に呼ぶ。 */
+    /** 通知を止めるとき (設定 OFF・ログアウト) に呼ぶ。設定を書き換えてから呼ぶこと (lock の説明)。 */
     public static void clear(@NonNull Context context) {
+        clear(context, null);
+    }
+
+    /** onFailure: サーバーの予約を消せなかったときに呼ぶ (ログアウトで知らせる)。 */
+    public static void clear(@NonNull Context context, @androidx.annotation.Nullable Runnable onFailure) {
         Context ctx = context.getApplicationContext();
         PreferenceManager prefs = PreferenceManager.getInstance(ctx);
+        synchronized (lock) {
+            clearLocked(ctx, prefs, onFailure);
+        }
+    }
+
+    /** lock の中で呼ぶ。 */
+    private static void clearLocked(Context ctx, PreferenceManager prefs,
+                                    @androidx.annotation.Nullable Runnable onFailure) {
         // サーバーが何も持っていないと分かっているなら送る必要がない。
         if (!prefs.isServerHoldingReminders()) return;
+        long seq = holdingSeq;
         push(ctx).syncAssignmentReminders(new ArrayList<>(), true, ok -> {
-            if (ok) prefs.setServerHoldingReminders(false);
+            if (ok) {
+                synchronized (lock) {
+                    // 「サーバーは空」と言い切れるのは clearAll のとき、それも削除のあとに同期を積んでいないときだけ。
+                    if (holdingSeq == seq) prefs.setServerHoldingReminders(false);
+                }
+            } else if (onFailure != null) {
+                onFailure.run();
+            }
         });
     }
 
@@ -87,7 +139,7 @@ public final class AssignmentReminderSync {
         Map<String, Integer> minutesById = new HashMap<>(PRESET_MINUTES);
         Map<String, String> labelById = new HashMap<>();
         for (Map.Entry<String, Integer> e : PRESET_MINUTES.entrySet()) {
-            labelById.put(e.getKey(), presetLabel(e.getValue()));
+            labelById.put(e.getKey(), presetLabel(ctx, e.getValue()));
         }
         try {
             JSONArray customs = new JSONArray(prefs.getCustomNotifyTimes());
@@ -114,10 +166,11 @@ public final class AssignmentReminderSync {
                 if (minutes == null) continue;
                 long triggerMs = dueMs - minutes * 60_000L;
                 if (triggerMs <= now) continue;
-                String url = MoodleService.currentBaseUrl() + "/mod/assign/view.php?id=" + a.getId();
+                // 開く先が分からない古いキャッシュでは、別の課題を開くより Moodle のトップへ送る。
+                String url = a.getUrl() != null ? a.getUrl() : MoodleService.currentBaseUrl() + "/my/";
                 out.add(new PushNotificationService.AssignmentReminder(
                         a.getId(), id, iso.format(new Date(triggerMs)),
-                        "課題提出期限",
+                        ctx.getString(R.string.assignment_reminder_title),
                         a.getName() + " (" + labelById.get(id) + ")",
                         url));
             }
@@ -125,10 +178,11 @@ public final class AssignmentReminderSync {
         return out;
     }
 
-    private static String presetLabel(int minutes) {
-        if (minutes % 10080 == 0) return (minutes / 10080) + "週間前";
-        if (minutes % 1440 == 0) return (minutes / 1440) + "日前";
-        if (minutes % 60 == 0) return (minutes / 60) + "時間前";
-        return minutes + "分前";
+    /** 「10分前」「1時間前」「1日前」「1週間前」。設定画面の既定の選択肢と同じ文面。 */
+    public static String presetLabel(Context ctx, int minutes) {
+        if (minutes % 10080 == 0) return ctx.getString(R.string.notify_before_weeks_format, minutes / 10080);
+        if (minutes % 1440 == 0) return ctx.getString(R.string.notify_before_days_format, minutes / 1440);
+        if (minutes % 60 == 0) return ctx.getString(R.string.notify_before_hours_format, minutes / 60);
+        return ctx.getString(R.string.notify_before_minutes_format, minutes);
     }
 }

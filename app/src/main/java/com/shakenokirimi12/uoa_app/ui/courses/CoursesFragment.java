@@ -1,5 +1,6 @@
 package com.shakenokirimi12.uoa_app.ui.courses;
 
+import com.shakenokirimi12.uoa_app.services.AuthorizationContext;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.TextWatcher;
@@ -19,6 +20,7 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 import com.google.android.material.color.MaterialColors;
 import com.google.android.material.textfield.TextInputEditText;
 import com.shakenokirimi12.uoa_app.R;
+import com.shakenokirimi12.uoa_app.ui.util.FetchStatus;
 import com.shakenokirimi12.uoa_app.data.DataCache;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.MoodleCourse;
@@ -35,6 +37,9 @@ public class CoursesFragment extends Fragment {
     private SwipeRefreshLayout swipeRefresh;
     private RecyclerView recyclerCourses;
     private TextView textEmpty;
+    private View fetchNotice;
+    /** 直近の取得が失敗した (キャッシュは出したまま帯で知らせる)。 */
+    private boolean failed;
     private final CourseAdapter courseAdapter = new CourseAdapter();
     private final MoodleService moodleService = new MoodleService();
 
@@ -55,6 +60,7 @@ public class CoursesFragment extends Fragment {
         recyclerCourses.setLayoutManager(new LinearLayoutManager(requireContext()));
         recyclerCourses.setAdapter(courseAdapter);
         textEmpty = view.findViewById(R.id.text_empty);
+        fetchNotice = view.findViewById(R.id.fetch_notice);
         courseAdapter.registerAdapterDataObserver(new RecyclerView.AdapterDataObserver() {
             @Override
             public void onChanged() {
@@ -93,11 +99,20 @@ public class CoursesFragment extends Fragment {
         loadCourses(false);
     }
 
+    /** 一度も取れていないのに「コースがありません」とは言わない。取得中は何も出さない。 */
     private void updateEmptyState() {
         if (textEmpty == null) return;
+        FetchStatus.Empty kind = FetchStatus.emptyKind(
+                !PreferenceManager.getInstance(requireContext()).getUsername().isEmpty(), failed,
+                DataCache.getInstance(requireContext()).fetchedAt(DataCache.Dataset.COURSES));
+        if (kind == FetchStatus.Empty.NOT_LOGGED_IN) textEmpty.setText(R.string.not_logged_in_empty);
+        else if (kind == FetchStatus.Empty.UNAVAILABLE) textEmpty.setText(R.string.courses_unavailable);
+        else if (kind == FetchStatus.Empty.NONE) {
+            textEmpty.setText(courseAdapter.isFilteredOut()
+                    ? R.string.courses_no_search_match : R.string.courses_empty_message);
+        }
         boolean empty = courseAdapter.getItemCount() == 0;
-        textEmpty.setText("コースがありません");
-        textEmpty.setVisibility(empty ? View.VISIBLE : View.GONE);
+        textEmpty.setVisibility(empty && kind != FetchStatus.Empty.LOADING ? View.VISIBLE : View.GONE);
     }
 
     /** @param force true for pull-to-refresh; false skips the fetch while the cache is fresh. */
@@ -118,28 +133,34 @@ public class CoursesFragment extends Fragment {
         // ID/PW 誤りが確定している間は自動でログインを試みない (アカウントロック対策)。
         if (com.shakenokirimi12.uoa_app.data.PreferenceManager.getInstance(requireContext()).isCredentialsInvalid()) {
             if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
-            android.widget.Toast.makeText(requireContext(), com.shakenokirimi12.uoa_app.services.AuthErrors.INVALID_CREDENTIALS_MESSAGE, android.widget.Toast.LENGTH_LONG).show();
+            android.widget.Toast.makeText(requireContext(), com.shakenokirimi12.uoa_app.services.AuthErrors.invalidCredentialsMessage(), android.widget.Toast.LENGTH_LONG).show();
+            // 取りに行かなかったのも「取れていない」。ホーム・カレンダーと同じく帯と空表示で知らせる。
+            showFetchFailure();
             return;
         }
-        moodleService.ensureLoggedIn(user, pass, true, new ServiceCallback<Boolean>() {
+        // 引っ張って更新は利用者のやり直し。直前のログインの失敗による待ちを解く (画面を開いただけでは解かない)。
+        if (force) moodleService.allowLoginRetry();
+        moodleService.ensureLoggedIn(user, pass, AuthorizationContext.INTERACTIVE, new ServiceCallback<Boolean>() {
             @Override
             public void onSuccess(Boolean result) {
                 if (!isAdded()) return;
-                moodleService.fetchCourses(new ServiceCallback<List<MoodleCourse>>() {
+                moodleService.fetchCourses(AuthorizationContext.INTERACTIVE, new ServiceCallback<List<MoodleCourse>>() {
                     @Override
                     public void onSuccess(List<MoodleCourse> courses) {
                         if (!isAdded()) return;
-                        courseAdapter.setItems(courses);
-                        swipeRefresh.setRefreshing(false);
+                        // 先に保存する。空表示の判定は保存時刻 (fetchedAt) を見るので、後だと空の一覧が「取得中」扱いになる。
                         DataCache.getInstance(requireContext()).saveCourses(courses);
+                        failed = false;
+                        FetchStatus.hide(fetchNotice);
+                        courseAdapter.setItems(courses);
+                        updateEmptyState();
+                        swipeRefresh.setRefreshing(false);
                     }
 
                     @Override
                     public void onError(String message) {
                         swipeRefresh.setRefreshing(false);
-                        if (isAdded()) {
-                            Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show();
-                        }
+                        if (isAdded()) showFetchFailure();
                     }
                 });
             }
@@ -149,10 +170,19 @@ public class CoursesFragment extends Fragment {
                 // requireContext() は detach 後に投げるので、isAdded の内側で呼ぶ
                 if (isAdded()) MoodleService.markInvalidIfCredentialsError(requireContext(), message);
                 swipeRefresh.setRefreshing(false);
-                if (isAdded()) {
+                if (!isAdded()) return;
+                showFetchFailure();
+                if (com.shakenokirimi12.uoa_app.services.AuthErrors.isInvalidCredentials(message)) {
                     Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show();
                 }
             }
         });
+    }
+
+    /** キャッシュは出したまま、いつの情報かを帯で示す。 */
+    private void showFetchFailure() {
+        failed = true;
+        FetchStatus.showFailure(fetchNotice, DataCache.getInstance(requireContext()).fetchedAt(DataCache.Dataset.COURSES));
+        updateEmptyState();
     }
 }

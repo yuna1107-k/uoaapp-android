@@ -12,7 +12,6 @@ import androidx.navigation.NavController;
 import androidx.navigation.Navigation;
 
 import com.google.android.material.button.MaterialButton;
-import com.google.android.material.radiobutton.MaterialRadioButton;
 import com.shakenokirimi12.uoa_app.R;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 
@@ -21,16 +20,12 @@ import com.shakenokirimi12.uoa_app.data.PreferenceManager;
  * iOS はページ送り形式だが、Android は 1 枚のスクロール画面にしている (カード単位で区切れば情報量は
  * 収まり、ViewPager2 とインジケータを増やす理由が無いため)。
  * 引数 next_action ("login" / "otp_registration") で、「今すぐ」を押したときの動作を決める。
- * login の場合は画面を出さずに同期を 1 回走らせるだけ (ログインは同期の裏で完結する)。
+ * login の場合はホームへ戻り、ホームの対話的な取得でログインする。
  */
 public class IdPTutorialFragment extends Fragment {
     public static final String ARG_NEXT_ACTION = "next_action";
     public static final String ACTION_LOGIN = "login";
     public static final String ACTION_OTP_REGISTRATION = "otp_registration";
-
-    private boolean otpAutoFetchChoice = true;
-    private MaterialRadioButton radioAuto;
-    private MaterialRadioButton radioManual;
 
     @Nullable
     @Override
@@ -44,28 +39,14 @@ public class IdPTutorialFragment extends Fragment {
         super.onViewCreated(view, savedInstanceState);
         String nextAction = getArguments() != null ? getArguments().getString(ARG_NEXT_ACTION, ACTION_LOGIN) : ACTION_LOGIN;
 
-        radioAuto = view.findViewById(R.id.radio_otp_auto);
-        radioManual = view.findViewById(R.id.radio_otp_manual);
-        view.findViewById(R.id.row_otp_auto).setOnClickListener(v -> setChoice(true));
-        view.findViewById(R.id.row_otp_manual).setOnClickListener(v -> setChoice(false));
-        // 既定は自動取得 (PreferenceManager.isOtpAutoFetchEnabled の既定と揃える)。
-        setChoice(true);
-
         MaterialButton startNow = view.findViewById(R.id.button_start_now);
         startNow.setText(ACTION_OTP_REGISTRATION.equals(nextAction) ? "今すぐ設定する" : "今すぐログインする");
         startNow.setOnClickListener(v -> finish(true, nextAction));
         view.findViewById(R.id.button_later).setOnClickListener(v -> finish(false, nextAction));
     }
 
-    private void setChoice(boolean auto) {
-        otpAutoFetchChoice = auto;
-        radioAuto.setChecked(auto);
-        radioManual.setChecked(!auto);
-    }
-
     private void finish(boolean startNow, String nextAction) {
         PreferenceManager prefs = PreferenceManager.getInstance(requireContext());
-        prefs.setOtpAutoFetchEnabled(otpAutoFetchChoice);
         prefs.setHasSeenIdPTutorial(true);
         NavController nav = Navigation.findNavController(requireView());
         if (!startNow) {
@@ -77,8 +58,18 @@ public class IdPTutorialFragment extends Fragment {
             nav.navigate(R.id.action_idp_tutorial_to_otp_registration);
             return;
         }
-        // ログインは同期の裏で完結する。専用のログイン画面は出さず、普通に同期する (iOS と同じ)。
-        nav.popBackStack();
-        com.shakenokirimi12.uoa_app.services.sync.SyncScheduler.syncNow(requireContext().getApplicationContext());
+        // 以前はバックグラウンドの同期を呼ぶだけだった。バックグラウンドは新規ログインを始めない決まり
+        // (AuthorizationContext.BACKGROUND) なので、押しても何も起きなかった。ホームへ戻り、
+        // ホームの対話的な取得 (引っ張って更新と同じ) でログインさせる。
+        if (!prefs.hasCredentials() || prefs.isCredentialsInvalid()) {
+            // ID/パスワードが無い、または誤りと分かっている (ホームはこの状態ではログインを試みない)。
+            // 入力し直せるログインの画面へ。
+            nav.popBackStack();
+            nav.navigate(R.id.navigation_login_settings);
+            return;
+        }
+        nav.getBackStackEntry(R.id.navigation_home).getSavedStateHandle()
+                .set(com.shakenokirimi12.uoa_app.ui.home.HomeFragment.KEY_FORCE_SYNC, true);
+        nav.popBackStack(R.id.navigation_home, false);
     }
 }

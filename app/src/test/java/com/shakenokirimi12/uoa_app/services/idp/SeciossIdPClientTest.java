@@ -18,6 +18,41 @@ public class SeciossIdPClientTest {
             + "<input type=\"text\" name=\"username\">"
             + "</form>";
 
+    // OTP 入力画面の otp_type (uoa-unofficial-extension の fixtures/idp/allotplogin.html と同じ形)
+
+    @Test
+    public void otpType_readsValueFromScript() {
+        String html = "<script nonce=\"x\">\nvar error_onload = 0;\nvar otp_type = 'mail';\n</script>"
+                + "<script>if (otp_type == 'none') {}</script>";
+        assertEquals("mail", SeciossIdPClient.otpType(html));
+    }
+
+    /** otp_type が無いとき: メールを頼む仕組み (motp.cgi) があれば控えに任せ (null)、無ければ認証アプリ方式とみなす (iOS と同じ)。 */
+    @Test
+    public void otpType_missing_dependsOnMailDispatch() {
+        String mailUi = "<button id=\"otp_send_button\"></button><script>$.post('/pub/motp.cgi', {});</script>";
+        assertNull(SeciossIdPClient.otpType(mailUi));
+        String noMailUi = "<form action=\"allotplogin.cgi\"><input name=\"password\"><input type=\"hidden\" name=\"sessid\" value=\"abc123\"></form>";
+        assertEquals(SeciossIdPClient.NO_MAIL_DISPATCH_OTP_TYPE, SeciossIdPClient.otpType(noMailUi));
+        assertEquals(OtpMethod.AUTHENTICATOR, OtpMethod.fromOtpType(SeciossIdPClient.otpType(noMailUi)));
+        assertEquals("mail", SeciossIdPClient.otpType("<script>var otp_type = 'mail';</script>"));
+    }
+
+    /** 診断に送る形は名前だけで、値 (sessid・ユーザー名) を入れない。 */
+    @Test
+    public void otpPageShape_hasNamesButNoValues() {
+        String html = "<input type=\"hidden\" name=\"sessid\" value=\"deadbeef0123\"><input type=\"hidden\" name=\"username\" value=\"s1300000\">"
+                + "<input type=\"number\" id=\"password_input\" name=\"password\"><script>var error_onload = 0; var totp_mode = 'x';</script>";
+        String shape = SeciossIdPClient.otpPageShape(html);
+        assertEquals("motp=0;inputs=password,sessid,username;vars=error_onload,totp_mode", shape);
+        assertFalse(shape.contains("deadbeef"));
+        assertFalse(shape.contains("s1300000"));
+        // data-id などの属性の値は名前として拾わない。motp.cgi は大文字でも見つける。
+        assertEquals("motp=1;inputs=otp;vars=",
+                SeciossIdPClient.otpPageShape("<input name=\"otp\" data-id=\"s1300000\"><script src=\"/pub/MOTP.CGI\"></script>"));
+        assertNull(SeciossIdPClient.otpType("<script>$.post('/pub/MOTP.CGI')</script>"));
+    }
+
     @Test
     public void extractField_ignoresAttributeOrder() {
         // id/name/value の並びはページによって揺れるので、タグ全体を切ってから value を探す
@@ -153,11 +188,13 @@ public class SeciossIdPClientTest {
     @Test
     public void maintenanceError_loginAndRegistrationMessages() {
         SeciossError e = new SeciossError(SeciossError.Kind.MAINTENANCE, "メンテナンスモード しばらくお待ちください");
-        assertTrue(e.loginMessage().startsWith("大学のシステムがメンテナンス中です。終了後にもう一度お試しください。"));
-        assertTrue(e.loginMessage().contains("しばらくお待ちください"));
-        assertTrue(e.registrationMessage().startsWith("大学のシステムがメンテナンス中です。"));
-        assertTrue(new SeciossError(SeciossError.Kind.ACCESS_DENIED, "moodle_login_page")
-                .loginMessage().startsWith("Moodle 側でこのアカウントのシングルサインオン"));
+        // 文面は strings.xml (JVM のテストでは読めない)。どの文言に、どの detail を渡すかを確かめる。
+        String maintenance = com.shakenokirimi12.uoa_app.services.AppStrings.get(
+                com.shakenokirimi12.uoa_app.R.string.secioss_error_maintenance, "メンテナンスモード しばらくお待ちください");
+        assertEquals(maintenance, e.loginMessage());
+        assertEquals(maintenance, e.registrationMessage());
+        assertEquals(com.shakenokirimi12.uoa_app.services.AppStrings.get(com.shakenokirimi12.uoa_app.R.string.secioss_error_moodle_sso_not_ready),
+                new SeciossError(SeciossError.Kind.ACCESS_DENIED, "moodle_login_page").loginMessage());
     }
 
     @Test

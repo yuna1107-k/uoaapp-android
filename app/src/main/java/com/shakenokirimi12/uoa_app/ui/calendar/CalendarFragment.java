@@ -1,5 +1,6 @@
 package com.shakenokirimi12.uoa_app.ui.calendar;
 
+import com.shakenokirimi12.uoa_app.services.AuthorizationContext;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -10,11 +11,13 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
+import androidx.navigation.Navigation;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.material.tabs.TabLayout;
 import com.shakenokirimi12.uoa_app.R;
+import com.shakenokirimi12.uoa_app.ui.util.FetchStatus;
 import com.shakenokirimi12.uoa_app.data.DataCache;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.Assignment;
@@ -37,6 +40,11 @@ public class CalendarFragment extends Fragment {
     private TabLayout tabLayout;
     private RecyclerView recyclerEvents;
     private TextView textEmpty;
+    private View fetchNotice;
+    private boolean eventsFailed;
+    private boolean assignmentsFailed;
+    /** 未ログイン。「授業はありません」と言わない。 */
+    private boolean notLoggedIn;
     private final Calendar selectedDate = Calendar.getInstance();
 
     private List<CalendarEvent> allEvents = new ArrayList<>();
@@ -63,10 +71,20 @@ public class CalendarFragment extends Fragment {
         tabLayout = view.findViewById(R.id.tab_layout);
         recyclerEvents = view.findViewById(R.id.recycler_events);
         textEmpty = view.findViewById(R.id.text_empty);
+        fetchNotice = view.findViewById(R.id.fetch_notice);
         recyclerEvents.setLayoutManager(new LinearLayoutManager(requireContext()));
+        view.findViewById(R.id.button_friends_timetable).setOnClickListener(v ->
+                Navigation.findNavController(v).navigate(R.id.navigation_timetable_friends));
 
         classAdapter.setOnClassClickListener(cls ->
                 ClassDetailDialog.show(requireContext(), cls));
+        // ホームと同じ課題の詳細へ。以前はリスナーが無く、タップしても何も起きなかった。
+        assignmentAdapter.setOnAssignmentClickListener(assignment -> {
+            Bundle args = new Bundle();
+            args.putInt("assignment_id", assignment.getId());
+            Navigation.findNavController(requireView())
+                    .navigate(R.id.navigation_assignment_detail, args);
+        });
 
         calendarView.setOnDateSelectedListener((year, month, dayOfMonth) -> {
             selectedDate.set(year, month, dayOfMonth);
@@ -87,9 +105,10 @@ public class CalendarFragment extends Fragment {
         DataCache cache = DataCache.getInstance(requireContext());
         allEvents = cache.loadEvents();
         allAssignments = cache.loadAssignments();
-        if (!allEvents.isEmpty() || !allAssignments.isEmpty()) {
-            updateList();
-        }
+        // 空でも描く。キャッシュが新しいと loadData は取得を飛ばして何も描かないので、ここで描かないと
+        // 空表示の文言すら出ない白い画面になる (SyncWorker が空の一覧を保存した直後など)。
+        notLoggedIn = PreferenceManager.getInstance(requireContext()).getUsername().isEmpty();
+        updateList();
 
         loadData();
     }
@@ -108,45 +127,66 @@ public class CalendarFragment extends Fragment {
 
         // ID/PW 誤りが確定している間は自動でログインを試みない (アカウントロック対策)。
         if (com.shakenokirimi12.uoa_app.data.PreferenceManager.getInstance(requireContext()).isCredentialsInvalid()) {
-            android.widget.Toast.makeText(requireContext(), com.shakenokirimi12.uoa_app.services.AuthErrors.INVALID_CREDENTIALS_MESSAGE, android.widget.Toast.LENGTH_LONG).show();
+            android.widget.Toast.makeText(requireContext(), com.shakenokirimi12.uoa_app.services.AuthErrors.invalidCredentialsMessage(), android.widget.Toast.LENGTH_LONG).show();
+            eventsFailed = fetchEvents;
+            assignmentsFailed = fetchAssignments;
+            updateFetchNotice();
+            updateList();
             return;
         }
-        if (fetchEvents) csService.fetchCalendarEvents(user, pass, new ServiceCallback<List<CalendarEvent>>() {
+        if (fetchEvents) csService.fetchCalendarEvents(user, pass, AuthorizationContext.INTERACTIVE, new ServiceCallback<List<CalendarEvent>>() {
             @Override
             public void onSuccess(List<CalendarEvent> events) {
                 if (!isAdded()) return;
                 allEvents = events;
-                updateList();
+                eventsFailed = false;
                 DataCache.getInstance(requireContext()).saveEvents(events);
+                // 取り直した時間割で、終わった授業の「欠席？（要確認）」を見る。
+                com.shakenokirimi12.uoa_app.services.attendance.AutoAbsenceRunner.evaluateAsync(requireContext());
+                updateFetchNotice();
+                updateList();
             }
             @Override
             public void onError(String message) {
-                if (isAdded()) com.shakenokirimi12.uoa_app.services.AuthErrors.markInvalidIfCredentialsError(requireContext(), message);
-                // Lead with the meaning; the raw reason (host, port) stays for diagnosis.
-                if (isAdded()) Toast.makeText(requireContext(), "CampusSquare の予定を取得できませんでした\n" + message, Toast.LENGTH_LONG).show();
+                if (!isAdded()) return;
+                com.shakenokirimi12.uoa_app.services.AuthErrors.markInvalidIfCredentialsError(requireContext(), message);
+                // キャッシュは出したまま、いつの情報かを帯で示す。
+                eventsFailed = true;
+                updateFetchNotice();
+                updateList();
             }
         });
 
-        if (fetchAssignments) moodleService.ensureLoggedIn(user, pass, true, new ServiceCallback<Boolean>() {
+        if (fetchAssignments) moodleService.ensureLoggedIn(user, pass, AuthorizationContext.INTERACTIVE, new ServiceCallback<Boolean>() {
             @Override
             public void onSuccess(Boolean result) {
                 if (!isAdded()) return;
-                moodleService.fetchAssignments(new ServiceCallback<List<Assignment>>() {
+                moodleService.fetchAssignments(AuthorizationContext.INTERACTIVE, new ServiceCallback<List<Assignment>>() {
                     @Override
                     public void onSuccess(List<Assignment> assignments) {
                         if (!isAdded()) return;
                         allAssignments = assignments;
-                        updateList();
+                        assignmentsFailed = false;
                         DataCache.getInstance(requireContext()).saveAssignments(assignments);
+                        updateFetchNotice();
+                        updateList();
                     }
                     @Override
-                    public void onError(String msg) {}
+                    public void onError(String msg) {
+                        if (!isAdded()) return;
+                        assignmentsFailed = true;
+                        updateFetchNotice();
+                        updateList();
+                    }
                 });
             }
             @Override
             public void onError(String msg) {
                 if (!isAdded()) return;
                 MoodleService.markInvalidIfCredentialsError(requireContext(), msg);
+                assignmentsFailed = true;
+                updateFetchNotice();
+                updateList();
             }
         });
     }
@@ -192,7 +232,8 @@ public class CalendarFragment extends Fragment {
             List<GroupedClass> grouped = GroupedClass.groupBySubject(dayEvents);
             recyclerEvents.setAdapter(classAdapter);
             classAdapter.setItems(grouped);
-            showEmpty(grouped.isEmpty(), R.string.calendar_no_classes);
+            showEmpty(grouped.isEmpty(), emptyKind(eventsFailed, DataCache.Dataset.EVENTS),
+                    R.string.classes_unavailable, R.string.calendar_no_classes);
         } else {
             List<Assignment> dayAssignments = new ArrayList<>();
             for (Assignment a : allAssignments) {
@@ -201,13 +242,36 @@ public class CalendarFragment extends Fragment {
             }
             recyclerEvents.setAdapter(assignmentAdapter);
             assignmentAdapter.setItems(dayAssignments);
-            showEmpty(dayAssignments.isEmpty(), R.string.calendar_no_assignments);
+            showEmpty(dayAssignments.isEmpty(), emptyKind(assignmentsFailed, DataCache.Dataset.ASSIGNMENTS),
+                    R.string.assignments_unavailable, R.string.calendar_no_assignments);
         }
     }
 
-    private void showEmpty(boolean empty, int messageRes) {
-        textEmpty.setText(messageRes);
-        textEmpty.setVisibility(empty ? View.VISIBLE : View.GONE);
+    /** 失敗した側のうち、古い方の最終更新時刻を出す。どちらも成功していれば消す。 */
+    private void updateFetchNotice() {
+        if (!eventsFailed && !assignmentsFailed) {
+            FetchStatus.hide(fetchNotice);
+            return;
+        }
+        DataCache cache = DataCache.getInstance(requireContext());
+        long events = eventsFailed ? cache.fetchedAt(DataCache.Dataset.EVENTS) : Long.MAX_VALUE;
+        long assignments = assignmentsFailed ? cache.fetchedAt(DataCache.Dataset.ASSIGNMENTS) : Long.MAX_VALUE;
+        FetchStatus.showFailure(fetchNotice, Math.min(events, assignments));
+    }
+
+    private FetchStatus.Empty emptyKind(boolean failed, DataCache.Dataset dataset) {
+        return FetchStatus.emptyKind(!notLoggedIn, failed, DataCache.getInstance(requireContext()).fetchedAt(dataset));
+    }
+
+    /** 空の一覧の文言。取得中 (LOADING) は何も出さない。 */
+    private void showEmpty(boolean empty, FetchStatus.Empty kind, int unavailableRes, int noneRes) {
+        switch (kind) {
+            case NOT_LOGGED_IN: textEmpty.setText(R.string.not_logged_in_empty); break;
+            case UNAVAILABLE: textEmpty.setText(unavailableRes); break;
+            case NONE: textEmpty.setText(noneRes); break;
+            default: break;
+        }
+        textEmpty.setVisibility(empty && kind != FetchStatus.Empty.LOADING ? View.VISIBLE : View.GONE);
         recyclerEvents.setVisibility(empty ? View.GONE : View.VISIBLE);
     }
 }

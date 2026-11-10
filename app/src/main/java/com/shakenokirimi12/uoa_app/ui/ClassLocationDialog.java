@@ -1,8 +1,10 @@
 package com.shakenokirimi12.uoa_app.ui;
 
 import android.content.Context;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.net.Uri;
+import android.widget.Toast;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.webkit.WebSettings;
@@ -19,6 +21,8 @@ public class ClassLocationDialog {
     private static final double CAMPUS_LNG = 139.9388;
 
     public static void show(Context context, GroupedClass cls) {
+        com.shakenokirimi12.uoa_app.services.usage.UsageStats.record(context,
+                com.shakenokirimi12.uoa_app.services.usage.UsageFeature.CLASS_LOCATION);
         View dialogView = LayoutInflater.from(context)
                 .inflate(R.layout.dialog_class_location, null);
 
@@ -28,32 +32,45 @@ public class ClassLocationDialog {
 
         textClassName.setText(cls.getSummary());
         textLocation.setText(cls.getLocation() != null && !cls.getLocation().isEmpty()
-                ? cls.getLocation() : "教室情報なし");
+                ? cls.getLocation() : context.getString(R.string.class_location_dialog_no_room));
 
         WebSettings ws = webView.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
 
-        String html = buildMapHtml(cls.getLocation());
+        String universityName = context.getString(R.string.class_location_dialog_university_name);
+        String html = buildMapHtml(cls.getLocation(), universityName);
         webView.loadDataWithBaseURL("https://www.openstreetmap.org",
                 html, "text/html", "UTF-8", null);
 
         dialogView.findViewById(R.id.button_open_maps).setOnClickListener(v -> {
             String query = cls.getLocation() != null && !cls.getLocation().isEmpty()
-                    ? cls.getLocation() + " 会津大学" : "会津大学";
+                    ? cls.getLocation() + " " + universityName : universityName;
             Uri gmmUri = Uri.parse("geo:" + CAMPUS_LAT + "," + CAMPUS_LNG
                     + "?q=" + Uri.encode(query));
             Intent mapIntent = new Intent(Intent.ACTION_VIEW, gmmUri);
-            context.startActivity(mapIntent);
+            // geo: を受ける地図アプリが無い端末では ActivityNotFoundException で落ちていた。
+            // ブラウザの Google マップに落とし、それも無ければその旨を出す。
+            try {
+                context.startActivity(mapIntent);
+            } catch (ActivityNotFoundException noMapApp) {
+                Uri webUri = Uri.parse("https://www.google.com/maps/search/?api=1&query="
+                        + Uri.encode(query));
+                try {
+                    context.startActivity(new Intent(Intent.ACTION_VIEW, webUri));
+                } catch (ActivityNotFoundException noBrowser) {
+                    Toast.makeText(context, R.string.class_location_dialog_no_map_app, Toast.LENGTH_SHORT).show();
+                }
+            }
         });
 
         new MaterialAlertDialogBuilder(context)
                 .setView(dialogView)
-                .setPositiveButton("閉じる", null)
+                .setPositiveButton(R.string.close, null)
                 .show();
     }
 
-    private static String buildMapHtml(String location) {
+    private static String buildMapHtml(String location, String universityName) {
         return "<!DOCTYPE html><html><head>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
                 + "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'/>"
@@ -66,7 +83,7 @@ public class ClassLocationDialog {
                 + "L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{"
                 + "attribution:'© OSM'}).addTo(map);"
                 + "L.marker([" + CAMPUS_LAT + "," + CAMPUS_LNG + "])"
-                + ".addTo(map).bindPopup('" + escapeJs(location != null ? location : "会津大学") + "').openPopup();"
+                + ".addTo(map).bindPopup('" + escapeJs(location != null ? location : universityName) + "').openPopup();"
                 + "</script></body></html>";
     }
 

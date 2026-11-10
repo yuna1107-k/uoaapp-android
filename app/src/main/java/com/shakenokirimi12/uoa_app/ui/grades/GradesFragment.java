@@ -1,5 +1,6 @@
 package com.shakenokirimi12.uoa_app.ui.grades;
 
+import com.shakenokirimi12.uoa_app.services.AuthorizationContext;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -16,6 +17,7 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
 import com.google.android.material.color.MaterialColors;
 import com.shakenokirimi12.uoa_app.R;
+import com.shakenokirimi12.uoa_app.ui.util.FetchStatus;
 import com.shakenokirimi12.uoa_app.data.DataCache;
 import com.shakenokirimi12.uoa_app.data.PreferenceManager;
 import com.shakenokirimi12.uoa_app.data.models.Grade;
@@ -29,6 +31,9 @@ public class GradesFragment extends Fragment {
 
     private SwipeRefreshLayout swipeRefresh;
     private TextView textEmpty;
+    private View fetchNotice;
+    /** 直近の取得が失敗した (キャッシュは出したまま帯で知らせる)。 */
+    private boolean failed;
     private final GradeAdapter gradeAdapter = new GradeAdapter();
     private final CampusSquareService csService = new CampusSquareService();
 
@@ -46,6 +51,7 @@ public class GradesFragment extends Fragment {
 
         swipeRefresh = view.findViewById(R.id.swipe_refresh);
         textEmpty = view.findViewById(R.id.text_empty);
+        fetchNotice = view.findViewById(R.id.fetch_notice);
         RecyclerView recycler = view.findViewById(R.id.recycler_grades);
         recycler.setLayoutManager(new LinearLayoutManager(requireContext()));
         recycler.setAdapter(gradeAdapter);
@@ -81,30 +87,56 @@ public class GradesFragment extends Fragment {
         // ID/PW 誤りが確定している間は自動でログインを試みない (アカウントロック対策)。
         if (com.shakenokirimi12.uoa_app.data.PreferenceManager.getInstance(requireContext()).isCredentialsInvalid()) {
             if (swipeRefresh != null) swipeRefresh.setRefreshing(false);
-            android.widget.Toast.makeText(requireContext(), com.shakenokirimi12.uoa_app.services.AuthErrors.INVALID_CREDENTIALS_MESSAGE, android.widget.Toast.LENGTH_LONG).show();
+            android.widget.Toast.makeText(requireContext(), com.shakenokirimi12.uoa_app.services.AuthErrors.invalidCredentialsMessage(), android.widget.Toast.LENGTH_LONG).show();
+            // 取りに行かなかったのも「取れていない」。ホーム・カレンダーと同じく帯と空表示で知らせる。
+            showFetchFailure();
             return;
         }
-        csService.fetchGrades(user, pass, new ServiceCallback<List<Grade>>() {
+        // 引っ張って更新は利用者のやり直し。直前のログインの失敗による待ちを解く (画面を開いただけでは解かない)。
+        if (force) csService.allowLoginRetry();
+        csService.fetchGrades(user, pass, AuthorizationContext.INTERACTIVE, new ServiceCallback<List<Grade>>() {
             @Override
             public void onSuccess(List<Grade> grades) {
                 if (!isAdded()) return;
+                // 先に保存する。空表示の判定は保存時刻 (fetchedAt) を見るので、後だと空の一覧が「取得中」扱いになる。
+                DataCache.getInstance(requireContext()).saveGrades(grades);
                 gradeAdapter.setItems(grades);
+                failed = false;
+                FetchStatus.hide(fetchNotice);
                 updateEmptyState();
                 swipeRefresh.setRefreshing(false);
-                DataCache.getInstance(requireContext()).saveGrades(grades);
             }
 
             @Override
             public void onError(String message) {
-                if (isAdded()) com.shakenokirimi12.uoa_app.services.AuthErrors.markInvalidIfCredentialsError(requireContext(), message);
                 swipeRefresh.setRefreshing(false);
-                if (isAdded()) Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show();
+                if (!isAdded()) return;
+                com.shakenokirimi12.uoa_app.services.AuthErrors.markInvalidIfCredentialsError(requireContext(), message);
+                showFetchFailure();
+                if (com.shakenokirimi12.uoa_app.services.AuthErrors.isInvalidCredentials(message)) {
+                    Toast.makeText(requireContext(), message, Toast.LENGTH_SHORT).show();
+                }
             }
         });
     }
 
+    /** キャッシュは出したまま、いつの情報かを帯で示す。 */
+    private void showFetchFailure() {
+        failed = true;
+        FetchStatus.showFailure(fetchNotice, DataCache.getInstance(requireContext()).fetchedAt(DataCache.Dataset.GRADES));
+        updateEmptyState();
+    }
+
+    /** 一度も取れていないのに「成績データがありません」とは言わない。取得中は何も出さない。 */
     private void updateEmptyState() {
         if (textEmpty == null) return;
-        textEmpty.setVisibility(gradeAdapter.getItemCount() == 0 ? View.VISIBLE : View.GONE);
+        FetchStatus.Empty kind = FetchStatus.emptyKind(
+                !PreferenceManager.getInstance(requireContext()).getUsername().isEmpty(), failed,
+                DataCache.getInstance(requireContext()).fetchedAt(DataCache.Dataset.GRADES));
+        if (kind == FetchStatus.Empty.NOT_LOGGED_IN) textEmpty.setText(R.string.not_logged_in_empty);
+        else if (kind == FetchStatus.Empty.UNAVAILABLE) textEmpty.setText(R.string.grades_unavailable);
+        else if (kind == FetchStatus.Empty.NONE) textEmpty.setText(R.string.grades_empty_message);
+        boolean empty = gradeAdapter.getItemCount() == 0;
+        textEmpty.setVisibility(empty && kind != FetchStatus.Empty.LOADING ? View.VISIBLE : View.GONE);
     }
 }

@@ -9,6 +9,22 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <!-- 再起動で消えたジオフェンス (自動出席) を登録し直す -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- otpauth:// を受ける認証アプリが入っているか (AuthenticatorKeyActions.canOpen)。Android 11 以降は
+         宣言しないと見えない。host を絞って受けるアプリ (Bitwarden は otpauth://totp だけ) も見えるよう、
+         host 付きも並べる。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="otpauth" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="otpauth" android:host="totp" />
+        </intent>
+    </queries>
 
     <!-- OTP 登録で otpauth:// を受け取れる認証アプリがあるかを確かめるため (Android 11 以降のパッケージ可視性)。 -->
     <queries>
@@ -20,6 +36,8 @@
 
     <application
         android:allowBackup="true"
+        android:backupAgent=".services.UoaBackupAgent"
+        android:fullBackupOnly="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
@@ -59,12 +77,65 @@
             </intent-filter>
         </service>
 
+        <!-- PC 中継: 拡張の QR (uoa-app://otp-pair#p=..&k=..&n=..) を標準のカメラ / Google レンズで
+             読むとここが開く。確認ダイアログだけの透明な画面。 -->
+        <activity
+            android:name=".ui.otprelay.OtpRelayActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Uoaapp.Translucent">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="uoa-app" android:host="otp-pair" />
+            </intent-filter>
+        </activity>
+
+        <!-- 時間割共有: 友達の QR (uoa-app://timetable?id=...) を標準のカメラで読む・案内ページの「アプリで開く」・
+             一覧の「リンクを貼り付けて開く」でここが開く。友達の時間割を見せ、保存と送り返しは利用者が選ぶ。
+             回転などで作り直すと保存の途中で画面が戻り、もう一度保存・返事ができてしまうので、作り直さない。 -->
+        <activity
+            android:name=".ui.timetable.TimetableIncomingActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="uoa-app" android:host="timetable" />
+            </intent-filter>
+        </activity>
+
+        <!-- 同意を記録する前に作った連携の確認 (断った依頼の通知から開く)。外部から開かせないので非公開。 -->
+        <activity
+            android:name=".ui.otprelay.OtpRelayConsentActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Uoaapp.Translucent" />
+
         <activity
             android:name=".ui.browser.InAppBrowserActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden" />
+        <!-- 強制アップデートの全面表示。UoaApplication がどの画面の上にも出す。戻るキーでは閉じない。 -->
+        <activity
+            android:name=".ui.ForceUpdateActivity"
+            android:exported="false" />
         <activity
             android:name=".ui.onboarding.OnboardingActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Uoaapp.Onboarding" />
+        <!-- 初期設定から開く登録し直し。登録の画面はメイン画面の nav graph の中にあるので、ここに載せる。 -->
+        <activity
+            android:name=".ui.idp.IdPOtpRegistrationActivity"
             android:exported="false"
             android:theme="@style/Theme.Uoaapp.Onboarding" />
 
@@ -75,6 +146,20 @@
         <receiver
             android:name=".services.LocationGeofenceService$GeofenceReceiver"
             android:exported="false" />
+
+        <!-- 「欠席？（要確認）」の通知のボタン -->
+        <receiver
+            android:name=".services.attendance.AttendanceConfirmation$Receiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".services.LocationGeofenceService$RestoreReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>

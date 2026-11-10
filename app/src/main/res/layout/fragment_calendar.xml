@@ -7,6 +7,26 @@
     android:layout_height="match_parent"
     android:orientation="vertical">
 
+    <!-- 取得に失敗したとき「取得できませんでした（最終更新 …）」を出す (FetchStatus)。 -->
+    <include
+        android:id="@+id/fetch_notice"
+        layout="@layout/view_status_notice"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content" />
+
+    <!-- 時間割共有の入口 (iOS はカレンダーの上のバーの右)。日ごとの一覧の下に置くとその日の操作に見えるので、
+         月表示の上に置く。 -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/button_friends_timetable"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end"
+        android:layout_marginEnd="16dp"
+        android:text="@string/timetable_friends_entry"
+        app:icon="@drawable/ic_users"
+        app:iconGravity="textStart" />
+
     <!-- 自前の月表示。プラットフォームの CalendarView では授業・課題の点を日付に付けられない。 -->
     <com.google.android.material.card.MaterialCardView
         android:layout_width="match_parent"
