@@ -20,8 +20,8 @@ android {
         minSdk = 26
         targetSdk = 36
         // 値は gradle.properties の uoaVersionCode / uoaVersionName (1 か所で管理する)。
-        versionCode = providers.gradleProperty("uoaVersionCode").map { it.toInt() }.getOrElse(451250)
-        versionName = providers.gradleProperty("uoaVersionName").getOrElse("3.5.1_bata.0.1")
+        versionCode = providers.gradleProperty("uoaVersionCode").map { it.toInt() }.getOrElse(451290)
+        versionName = providers.gradleProperty("uoaVersionName").getOrElse("3.5.1_bata.0.2")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -101,6 +101,9 @@ dependencies {
 
     // Background sync
     implementation(libs.work.runtime)
+
+    // Wear OS へ時間割を送る (Data Layer)
+    implementation(libs.play.services.wearable)
 
     // Push (FCM)。app/google-services.json が必要 (Firebase コンソールから取得、gitignore 済み)
     implementation(platform(libs.firebase.bom))

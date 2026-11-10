@@ -8,6 +8,7 @@ import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -127,7 +128,7 @@ public final class ClassLiveUpdate {
                         new NotificationCompat.ProgressStyle.Segment(100)))
                 .setProgress(progress);
 
-        return new NotificationCompat.Builder(ctx, CHANNEL_ID)
+        NotificationCompat.Builder builder = new NotificationCompat.Builder(ctx, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_stat_calendar)
                 .setContentTitle(title)
                 .setContentText(text)
@@ -144,7 +145,15 @@ public final class ClassLiveUpdate {
                 .setUsesChronometer(true)
                 .setChronometerCountDown(true)
                 .setRequestPromotedOngoing(true)
-                .build();
+                // 時計には Wear アプリ (wear/…/ClassOngoingActivity) が自前で出す。転送されると二重になる。
+                .setLocalOnly(true);
+
+        long remainingMs = countdownTo - System.currentTimeMillis();
+        if (remainingMs > 0) {
+            builder.setTimeoutAfter(remainingMs);
+        }
+
+        return builder.build();
     }
 
     private static void post(Context ctx, Notification notification) {
@@ -175,9 +184,12 @@ public final class ClassLiveUpdate {
     private static void scheduleAt(Context ctx, long triggerAtMillis) {
         AlarmManager am = ctx.getSystemService(AlarmManager.class);
         if (am == null) return;
-        // 正確なアラームは Android 14 以降、既定では許可されない。表示の切り替わりが数分ずれても
-        // クロノメーターが残り時間を示し続けるので、非正確で足りる。
-        am.set(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmIntent(ctx));
+        // Doze 中でも切り替わり時刻に確実に起こすため AllowWhileIdle を使う。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && am.canScheduleExactAlarms()) {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmIntent(ctx));
+        } else {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, alarmIntent(ctx));
+        }
     }
 
     private static void cancelAlarm(Context ctx) {
