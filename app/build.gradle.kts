@@ -20,8 +20,8 @@ android {
         minSdk = 26
         targetSdk = 36
         // gradle.properties の uoaVersionCode / uoaVersionName を変える (wear と共有)。
-        versionCode = providers.gradleProperty("uoaVersionCode").get().toInt()
-        versionName = providers.gradleProperty("uoaVersionName").get()
+        versionCode = providers.gradleProperty("uoaVersionCode").map { it.toInt() }.getOrElse(451220)
+        versionName = providers.gradleProperty("uoaVersionName").getOrElse("3.5.0")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
